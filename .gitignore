@@ -1,0 +1,10 @@
+.deps/
+runs/
+data/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+_probe.txt
+*.pt
+*.pth
