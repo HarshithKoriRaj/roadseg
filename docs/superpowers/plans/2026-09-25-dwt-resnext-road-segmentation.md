@@ -24,7 +24,7 @@
 - All metrics are computed on **stitched full-resolution images**, never on tiles.
 - Seeds are explicit and recorded. Test set is evaluated once, after all selection is frozen on validation.
 - Commit after every task. Attribution line on every commit:
-  `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
 
 ## Review Focus
 
@@ -114,7 +114,7 @@ Expected: PASS. Note `setup_deps.sh` may take several minutes; if the login node
 git add scripts/ src/ tests/ pytest.ini
 git commit -m "chore: project scaffolding and vendored deps
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -265,7 +265,7 @@ Expected: 5 passed.
 git add src/roadseg/models/wavelet.py tests/test_wavelet.py src/roadseg/models/__init__.py
 git commit -m "feat: orthonormal Haar DWT/IDWT as frozen conv kernels
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -415,7 +415,7 @@ Expected: 6 passed.
 git add src/roadseg/models/ops.py tests/test_ops.py
 git commit -m "feat: swappable down/up sampling operators
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -638,7 +638,7 @@ git commit -m "feat: ResNeXt encoder with rung config and stem weight adaptation
 Stride parity between R0 and R1 is asserted by test, so the ablation's
 central comparison cannot silently drift.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -758,7 +758,7 @@ Expected: 3 passed.
 git add src/roadseg/models/decoder.py tests/test_decoder.py
 git commit -m "feat: U-Net decoder with explicit skips
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -890,7 +890,7 @@ Expected: 10 passed. (`build_model`'s baselines branch is exercised in Task 16.)
 git add src/roadseg/models/segmenter.py tests/test_segmenter.py
 git commit -m "feat: segmenter assembly with enforced resolution invariant
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1028,7 +1028,7 @@ clDice implementation copied from sam2_road_dac, which is correct. Dice uses
 eps=1.0 for stability on the background-only crops that dominate at 4% road
 prevalence.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1200,7 +1200,7 @@ Expected: 8 passed.
 git add src/roadseg/metrics.py tests/test_metrics.py
 git commit -m "feat: nodata-aware pixel and relaxed-F1 metrics
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1398,7 +1398,7 @@ Ported from sam2_road_dac. The original snapped to the nearest node at any
 distance, giving credit to predictions with no nearby node and inflating the
 metric; and used an O(N^2) scan. Both corrected, both pinned by tests.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1523,7 +1523,7 @@ Expected: 8 passed.
 git add src/roadseg/data/tiling.py src/roadseg/data/__init__.py tests/test_tiling.py
 git commit -m "feat: sliding-window tiling with overlap-averaged stitching
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1706,7 +1706,7 @@ git commit -m "feat: dataset index with loud failure on missing masks
 DeepGlobe released labels only for train/; indexing valid/ or test/ now raises
 instead of failing later at image-open time.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1931,7 +1931,7 @@ git commit -m "feat: road-biased tile dataset with nodata masking
 Crop RNG uses a torch Generator, not np.random, which duplicates across
 DataLoader workers.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2093,7 +2093,7 @@ Expected: 3 passed.
 git add src/roadseg/engine.py tests/test_engine.py
 git commit -m "feat: training engine with buffer-preserving atomic checkpoints
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2283,7 +2283,7 @@ Expected: 5 passed.
 git add src/roadseg/eval.py src/roadseg/stats.py tests/test_stats.py
 git commit -m "feat: full-image evaluation and paired bootstrap
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2534,7 +2534,7 @@ Expected: 2 passed.
 git add src/roadseg/train.py configs/ scripts/sbatch_train_array.sh tests/test_train_cli.py
 git commit -m "feat: training entrypoint, configs, and 24-run SLURM array
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2736,7 +2736,7 @@ Expected: all tests pass.
 git add src/roadseg/models/baselines/ tests/test_baselines.py
 git commit -m "feat: U-Net and D-LinkNet baselines
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
