@@ -1,8 +1,10 @@
 """D-LinkNet: ResNet-34 encoder + dilated centre block + LinkNet decoder.
 
-Winner of the DeepGlobe 2018 road extraction challenge. The dilated block
-widens the receptive field without losing resolution, which is what makes it
-strong on long thin roads.
+Winner of the DeepGlobe 2018 road extraction challenge. The centre block is a
+CASCADE of dilated 3x3 convs (dilations 1, 2, 4, 8), each consuming the previous
+one's output, with all stage outputs and the input summed. Its receptive field
+reaches 1+2+4+8 = 15 pixels either side (31x31) without losing resolution, which
+is what makes it strong on long thin roads.
 """
 from __future__ import annotations
 
@@ -17,12 +19,14 @@ class _Dilated(nn.Module):
         self.branches = nn.ModuleList(
             [nn.Conv2d(ch, ch, 3, padding=d, dilation=d) for d in (1, 2, 4, 8)]
         )
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=False)  # outputs are summed later: no in-place
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
+        h = x
         for b in self.branches:
-            out = out + self.relu(b(x))
+            h = self.relu(b(h))
+            out = out + h
         return out
 
 

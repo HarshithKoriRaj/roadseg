@@ -66,3 +66,22 @@ def test_build_model_dispatches_to_baselines():
 def test_build_model_unknown_raises():
     with pytest.raises(ValueError, match="unknown baseline"):
         build_model({"model": "nope"})
+
+
+def test_dilated_centre_block_is_a_cascade():
+    # Cascade of dilations 1,2,4,8 reaches offset 1+2+4+8 = 15; a parallel block
+    # (all branches fed from x) reaches only 8.
+    from roadseg.models.baselines.dlinknet import _Dilated
+
+    blk = _Dilated(4).eval()
+    for b in blk.branches:
+        torch.nn.init.constant_(b.weight, 1.0)
+        torch.nn.init.zeros_(b.bias)
+    x = torch.zeros(1, 4, 64, 64)
+    x[:, :, 32, 32] = 1.0
+    with torch.no_grad():
+        out = blk(x)
+    changed = (out != 0).any(dim=1)[0]
+    rows, cols = changed.nonzero(as_tuple=True)
+    assert int((rows - 32).abs().max()) == 15
+    assert int((cols - 32).abs().max()) == 15
