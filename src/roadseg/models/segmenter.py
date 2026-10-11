@@ -50,4 +50,4 @@ def build_model(cfg: dict) -> nn.Module:
             hf_init=cfg.get("hf_init", "exact"),
         )
     from .baselines import build_baseline
-    return build_baseline(name)
+    return build_baseline(name, pretrained=cfg.get("pretrained", True))
