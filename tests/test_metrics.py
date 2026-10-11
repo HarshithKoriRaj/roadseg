@@ -28,13 +28,68 @@ def test_valid_mask_excludes_pixels_from_every_count():
     c = confusion(p, t, valid)
     assert c["tp"] + c["fp"] + c["fn"] + c["tn"] == 3, "masked pixel must not be counted"
     assert c["fp"] == 1
+    assert c["tn"] == 2
 
 
-def test_fully_nodata_region_is_not_nan():
-    """Nodata borders can make a whole tile invalid; denominators go to zero."""
+def test_fully_nodata_region_scores_nan():
+    """Zero valid pixels -> no score, never a perfect 1.0."""
     p = np.ones((4, 4), bool); t = np.zeros((4, 4), bool)
-    m = metrics_from_confusion(confusion(p, t, np.zeros((4, 4), bool)))
-    assert all(np.isfinite(v) for v in m.values())
+    nv = np.zeros((4, 4), bool)
+    m = metrics_from_confusion(confusion(p, t, nv))
+    assert len(m) == 4 and all(np.isnan(v) for v in m.values())
+    r = relaxed_f1(p, t, rho=3, valid=nv)
+    assert len(r) == 3 and all(np.isnan(v) for v in r.values())
+
+
+def test_all_background_on_valid_road_free_image_scores_one():
+    z = np.zeros((8, 8), bool)
+    m = metrics_from_confusion(confusion(z, z, np.ones((8, 8), bool)))
+    assert m["iou"] == 1.0 and m["f1"] == 1.0
+
+
+def test_confusions_sum_over_concatenated_images():
+    rng = np.random.default_rng(0)
+    p1, t1, p2, t2 = (rng.random((6, 5)) > 0.5 for _ in range(4))
+    v1, v2 = rng.random((6, 5)) > 0.2, rng.random((6, 5)) > 0.2
+    a, b = confusion(p1, t1, v1), confusion(p2, t2, v2)
+    c = confusion(np.concatenate([p1, p2]), np.concatenate([t1, t2]), np.concatenate([v1, v2]))
+    assert c == {k: a[k] + b[k] for k in a}
+
+
+def test_shape_mismatch_raises():
+    a = np.zeros((4, 4), bool); b = np.zeros((4, 5), bool)
+    with pytest.raises(ValueError):
+        confusion(a, b)
+    with pytest.raises(ValueError):
+        confusion(a, a, b)
+    with pytest.raises(ValueError):
+        relaxed_f1(a, b)
+    with pytest.raises(ValueError):
+        relaxed_f1(a, a, valid=b)
+
+
+def _pt(r, c):
+    x = np.zeros((32, 32), bool); x[r, c] = True
+    return x
+
+
+def test_relaxed_f1_axis_offset_is_credited():
+    assert relaxed_f1(_pt(10, 13), _pt(10, 10), rho=3)["relaxed_f1"] == 1.0
+
+
+def test_relaxed_f1_is_euclidean_not_chebyshev():
+    p, t = _pt(13, 13), _pt(10, 10)   # distance sqrt(18) ~ 4.24
+    assert relaxed_f1(p, t, rho=3)["relaxed_f1"] == 0.0
+    assert relaxed_f1(p, t, rho=5)["relaxed_f1"] == 1.0
+
+
+def test_relaxed_match_inside_nodata_still_credits_valid_pixel():
+    t = np.zeros((32, 32), bool); t[10, :] = True
+    valid = np.ones((32, 32), bool); valid[:12] = False
+    near = np.zeros((32, 32), bool); near[12, :] = True
+    far = np.zeros((32, 32), bool); far[20, :] = True
+    assert relaxed_f1(near, t, rho=3, valid=valid)["relaxed_precision"] == 1.0
+    assert relaxed_f1(far, t, rho=3, valid=valid)["relaxed_precision"] == 0.0
 
 
 def test_relaxed_f1_credits_a_small_offset():
