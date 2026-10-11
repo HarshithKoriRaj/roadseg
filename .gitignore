@@ -1,6 +1,6 @@
 .deps/
 runs/
-data/
+/data/
 logs/
 __pycache__/
 *.pyc
