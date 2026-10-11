@@ -60,14 +60,21 @@ def soft_cl_dice_loss(
     return ((1 - dice) + (1 - cl_dice)).mean() * 0.5
 
 
-def dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
-    """Soft Dice on logits.
+def dice_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None,
+              eps: float = 1.0) -> torch.Tensor:
+    """Soft Dice on logits, computed in fp32, optionally restricted to `valid` pixels.
 
     eps=1.0 (not 1e-6) is deliberate: at ~4% road prevalence most crops are
     entirely background, and a tiny epsilon makes the empty-mask case numerically
     unstable rather than merely near-zero.
     """
+    logits = logits.float()
+    target = target.float()
     prob = torch.sigmoid(logits)
+    if valid is not None:
+        valid = valid.float()
+        prob = prob * valid
+        target = target * valid
     dims = (-1, -2, -3)
     inter = (prob * target).sum(dims)
     denom = prob.sum(dims) + target.sum(dims)
@@ -75,20 +82,33 @@ def dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0) -> t
 
 
 class ComboLoss(nn.Module):
-    """BCE + Dice, optionally + soft-clDice (rung R3).
+    """BCE + Dice, optionally + soft-clDice (rung R3), masked by `valid`.
 
     Takes **logits**. The clDice term needs probabilities, so the sigmoid is
-    applied here — callers must never pre-activate.
+    applied here — callers must never pre-activate. Always computed in fp32
+    (bf16 sums over 512x512 pixels would round the Dice denominator).
+    `valid` ([B,1,H,W], 1 = use pixel) excludes no-data pixels from every term.
     """
 
     def __init__(self, use_cldice: bool = False, cldice_weight: float = 1.0) -> None:
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
         self.use_cldice = use_cldice
         self.cldice_weight = cldice_weight
 
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss = self.bce(logits, target) + dice_loss(logits, target)
+    def forward(self, logits: torch.Tensor, target: torch.Tensor,
+                valid: torch.Tensor | None = None) -> torch.Tensor:
+        logits = logits.float()
+        target = target.float()
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        if valid is None:
+            bce = bce.mean()
+        else:
+            valid = valid.float()
+            bce = (bce * valid).sum() / valid.sum().clamp_min(1.0)
+        loss = bce + dice_loss(logits, target, valid)
         if self.use_cldice:
-            loss = loss + self.cldice_weight * soft_cl_dice_loss(torch.sigmoid(logits), target)
+            prob = torch.sigmoid(logits)
+            if valid is not None:
+                prob, target = prob * valid, target * valid
+            loss = loss + self.cldice_weight * soft_cl_dice_loss(prob, target)
         return loss
