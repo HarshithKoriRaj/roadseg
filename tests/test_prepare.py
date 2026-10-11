@@ -1,4 +1,6 @@
 import hashlib
+import importlib.util
+import io
 from pathlib import Path
 
 import pytest
@@ -6,7 +8,10 @@ import pytest
 from roadseg.data.prepare import MissingMaskError, build_index, deepglobe_splits
 
 REAL_ROOT = Path("/scratch/hk4488/roadseg/data")
-needs_data = pytest.mark.skipif(not REAL_ROOT.exists(), reason="real data not on disk")
+needs_mass = pytest.mark.skipif(not (REAL_ROOT / "massachusetts" / "train").exists(),
+                                reason="real Massachusetts data not on disk")
+needs_dg = pytest.mark.skipif(not (REAL_ROOT / "deepglobe" / "train").exists(),
+                              reason="real DeepGlobe data not on disk")
 
 # Fingerprint of the DeepGlobe test split (seed 1337, 70/15/15). Must never drift.
 DG_TEST_FIRST5 = ['101296', '102699', '104350', '104607', '1054']
@@ -83,7 +88,7 @@ def test_massachusetts_synthetic_missing_label_raises(tmp_path):
         build_index(tmp_path, "massachusetts", "train")
 
 
-@needs_data
+@needs_mass
 @pytest.mark.parametrize("split,n", [("train", 1108), ("val", 14), ("test", 49)])
 def test_real_massachusetts_index(split, n):
     idx = build_index(REAL_ROOT / "massachusetts", "massachusetts", split)
@@ -92,7 +97,7 @@ def test_real_massachusetts_index(split, n):
     assert len({r["id"] for r in idx}) == n
 
 
-@needs_data
+@needs_dg
 def test_real_deepglobe_splits_and_index():
     root = REAL_ROOT / "deepglobe"
     s = deepglobe_splits(root)
@@ -106,8 +111,46 @@ def test_real_deepglobe_splits_and_index():
         assert all(r["image"].exists() and r["mask"].exists() for r in idx)
 
 
-@needs_data
+@needs_dg
 def test_real_deepglobe_test_split_fingerprint():
     test_ids = sorted(deepglobe_splits(REAL_ROOT / "deepglobe")["test"])
     assert test_ids[:5] == DG_TEST_FIRST5
     assert hashlib.sha256("\n".join(test_ids).encode()).hexdigest() == DG_TEST_SHA256
+
+
+def _load_downloader():
+    spec = importlib.util.spec_from_file_location(
+        "download_data", Path(__file__).resolve().parents[1] / "scripts" / "download_data.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeResp(io.BytesIO):
+    def __init__(self, body, headers):
+        super().__init__(body)
+        self.headers = headers
+
+
+def test_truncated_download_is_rejected_and_leaves_no_file(tmp_path):
+    dl = _load_downloader()
+    dest = tmp_path / "a.tiff"
+    with pytest.raises(IOError, match="truncated"):
+        dl.save_body(_FakeResp(b"x" * 10, {"Content-Length": "20"}), dest)
+    assert not dest.exists()
+    assert not (tmp_path / "a.tiff.part").exists()
+
+
+def test_complete_download_is_written(tmp_path):
+    dl = _load_downloader()
+    dest = tmp_path / "a.tiff"
+    assert dl.save_body(_FakeResp(b"x" * 20, {"Content-Length": "20"}), dest) == 20
+    assert dest.read_bytes() == b"x" * 20
+    assert not (tmp_path / "a.tiff.part").exists()
+
+
+def test_empty_download_is_rejected(tmp_path):
+    dl = _load_downloader()
+    with pytest.raises(IOError, match="empty"):
+        dl.save_body(_FakeResp(b"", {}), tmp_path / "a.tiff")
+    assert not (tmp_path / "a.tiff").exists()

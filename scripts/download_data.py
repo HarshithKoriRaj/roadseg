@@ -25,18 +25,30 @@ discarded, so every reported number depends only on our recorded, seeded split.
 
 Resumable: existing non-empty files are skipped; downloads go to <file>.part and
 are renamed on success; transient errors are retried with backoff; failures are
-collected rather than aborting. Exit status is nonzero until the verification
-(Massachusetts 1108/14/49 sat == map; DeepGlobe 6226 paired) passes.
+collected rather than aborting. A body shorter than the response's
+Content-Length is rejected (the .part is deleted and the attempt retried), so a
+dropped connection can never leave a truncated file in place. Exit status is
+nonzero until the verification passes: Massachusetts 1108/14/49 sat == map with
+every file fully decoded (1500x1500, imagery RGB, labels single-channel with
+values in {0,255}); DeepGlobe 6226 paired, all non-empty, a fixed-seed sample of
+200 pairs decoded at 1024x1024. PIL/numpy are imported lazily by verify only.
+
+Repair: verify prints the path of every corrupt file. Delete those files and
+re-run the script; existing good files are skipped and only the deleted ones
+are re-fetched. (A bad DeepGlobe file is repaired by deleting it and the
+script re-extracting from the zips, which are re-downloaded.)
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import random
 import re
 import shutil
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -62,23 +74,53 @@ def _present(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
+def save_body(resp, dest: Path) -> int:
+    """Copy resp's body to dest via dest.part, rejecting short or empty bodies.
+
+    resp needs .read() and .headers. A body shorter than Content-Length (when
+    given) raises IOError and removes the .part; dest is only ever created by
+    renaming a complete file. Returns bytes written.
+    """
+    part = dest.with_name(dest.name + ".part")
+    n = 0
+    try:
+        with open(part, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                n += len(chunk)
+        expected = resp.headers.get("Content-Length")
+        if expected is not None and n != int(expected):
+            raise IOError(f"truncated download: got {n} bytes, Content-Length {expected}")
+        if n == 0:
+            raise IOError("empty download")
+        part.replace(dest)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    return n
+
+
 def fetch(url: str, dest: Path, tries: int = 6) -> bool:
     """Download url to dest via dest.part; skip if dest is already non-empty."""
     if _present(dest):
         return True
     dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_name(dest.name + ".part")
     err: Exception | None = None
     for i in range(tries):
         try:
-            with _get(url) as r, open(part, "wb") as f:
-                shutil.copyfileobj(r, f, 1 << 20)
-            if part.stat().st_size == 0:
-                raise IOError("empty download")
-            part.replace(dest)
+            with _get(url) as r:
+                save_body(r, dest)
             return True
+        except urllib.error.HTTPError as e:
+            err = e
+            if e.code == 404:
+                break  # permanent; do not retry
         except Exception as e:  # noqa: BLE001 - retried, then reported
             err = e
+        if i < tries - 1:
             time.sleep(4 * (i + 1))
     log(f"FAILED {url}: {err}")
     return False
@@ -146,24 +188,76 @@ def download_deepglobe(data: Path) -> int:
     return bad
 
 
+def _check_image(args) -> str | None:
+    """Fully decode one image; return an error string or None. Runs in a worker."""
+    path, size, mode, binary = args
+    try:
+        import numpy as np
+        from PIL import Image
+        with Image.open(path) as img:
+            img.load()
+            if img.size != (size, size):
+                return f"{path}: size {img.size}, expected {(size, size)}"
+            if mode is not None and img.mode != mode:
+                return f"{path}: mode {img.mode}, expected {mode}"
+            arr = np.asarray(img)
+        if binary:
+            if arr.ndim != 2:
+                return f"{path}: label not single-channel (shape {arr.shape})"
+            vals = set(np.unique(arr).tolist())
+            if not vals <= {0, 255}:
+                return f"{path}: label values {sorted(vals)} not subset of {{0,255}}"
+    except Exception as e:  # noqa: BLE001
+        return f"{path}: {type(e).__name__}: {e}"
+    return None
+
+
+def _run_checks(jobs) -> list[str]:
+    with cf.ProcessPoolExecutor(4) as ex:
+        return [e for e in ex.map(_check_image, jobs, chunksize=16) if e]
+
+
 def verify(data: Path) -> bool:
     good = True
     root = data / "massachusetts"
+    jobs = []
     for split, n in MASS_EXPECTED.items():
-        def stems(d):
-            return {p.stem for p in (root / d).glob("*.tif*") if p.suffix.lower() in (".tif", ".tiff")}
-        a, b = stems(split), stems(f"{split}_labels")
-        ok = len(a) == len(b) == n and a == b
+        def files(d):
+            return {p.stem: p for p in (root / d).glob("*.tif*") if p.suffix.lower() in (".tif", ".tiff")}
+        a, b = files(split), files(f"{split}_labels")
+        ok = len(a) == len(b) == n and set(a) == set(b)
         good &= ok
         log(f"verify massachusetts/{split}: sat={len(a)} map={len(b)} expected={n} "
             f"{'OK' if ok else 'MISMATCH'}")
+        jobs += [(str(p), 1500, "RGB", False) for p in a.values()]
+        jobs += [(str(p), 1500, "L", True) for p in b.values()]
+    log(f"decoding {len(jobs)} massachusetts files")
+    errs = _run_checks(jobs)
+    for e in errs:
+        log(f"CORRUPT {e}")
+    good &= not errs
+    log(f"verify massachusetts decode: {len(jobs) - len(errs)}/{len(jobs)} OK")
+
     d = data / "deepglobe" / "train"
-    sat = {p.name[: -len("_sat.jpg")] for p in d.glob("*_sat.jpg")}
-    msk = {p.name[: -len("_mask.png")] for p in d.glob("*_mask.png")}
-    ok = len(sat) == len(msk) == DEEPGLOBE_EXPECTED and sat == msk
+    sat = {p.name[: -len("_sat.jpg")]: p for p in d.glob("*_sat.jpg")}
+    msk = {p.name[: -len("_mask.png")]: p for p in d.glob("*_mask.png")}
+    ok = len(sat) == len(msk) == DEEPGLOBE_EXPECTED and set(sat) == set(msk)
+    empty = [str(p) for p in [*sat.values(), *msk.values()] if p.stat().st_size == 0]
+    for e in empty:
+        log(f"CORRUPT {e}: empty file")
+    ok &= not empty
     good &= ok
-    log(f"verify deepglobe/train: sat={len(sat)} mask={len(msk)} paired={len(sat & msk)} "
-        f"expected={DEEPGLOBE_EXPECTED} {'OK' if ok else 'MISMATCH'}")
+    log(f"verify deepglobe/train: sat={len(sat)} mask={len(msk)} paired={len(set(sat) & set(msk))} "
+        f"expected={DEEPGLOBE_EXPECTED} empty={len(empty)} {'OK' if ok else 'MISMATCH'}")
+    ids = sorted(set(sat) & set(msk))
+    sample = random.Random(0).sample(ids, min(200, len(ids)))
+    dg_jobs = [(str(sat[i]), 1024, None, False) for i in sample] + \
+              [(str(msk[i]), 1024, None, False) for i in sample]
+    errs = _run_checks(dg_jobs)
+    for e in errs:
+        log(f"CORRUPT {e}")
+    good &= not errs
+    log(f"verify deepglobe decode: {len(dg_jobs) - len(errs)}/{len(dg_jobs)} OK (sample of {len(sample)} pairs)")
     return good
 
 
