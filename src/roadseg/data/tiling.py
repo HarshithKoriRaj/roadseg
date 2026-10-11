@@ -16,6 +16,9 @@ import numpy as np
 
 
 def tile_positions(h: int, w: int, tile: int, stride: int) -> list[tuple[int, int]]:
+    if not 0 < stride <= tile:
+        raise ValueError(f"need 0 < stride <= tile, got stride={stride}, tile={tile}")
+
     def starts(extent: int) -> list[int]:
         if extent <= tile:
             return [0]
@@ -43,10 +46,16 @@ def tile_image(img: np.ndarray, tile: int, stride: int):
 
 
 def stitch(tiles, positions, h: int, w: int, tile: int) -> np.ndarray:
+    """Overlap-averaged reassembly. `tiles` are 2-D `[tile, tile]` arrays.
+
+    Raises ValueError if any pixel of the returned `[:h, :w]` region is uncovered.
+    """
     ph, pw = max(h, tile), max(w, tile)
     acc = np.zeros((ph, pw), np.float64)
     cnt = np.zeros((ph, pw), np.float64)
     for t, (y, x) in zip(tiles, positions):
         acc[y:y + tile, x:x + tile] += np.asarray(t, dtype=np.float64)
         cnt[y:y + tile, x:x + tile] += 1.0
+    if (cnt[:h, :w] == 0).any():
+        raise ValueError("positions leave part of the image uncovered")
     return (acc / np.maximum(cnt, 1.0))[:h, :w].astype(np.float32)

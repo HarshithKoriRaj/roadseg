@@ -26,9 +26,45 @@ def test_tiles_are_all_the_requested_size():
 def test_overlaps_are_averaged_not_overwritten():
     h = w = 768
     tiles, pos = tile_image(np.ones((h, w), np.float32), 512, 256)
-    tiles = [t * (i + 1) for i, t in enumerate(tiles)]
+    assert pos == [(0, 0), (0, 256), (256, 0), (256, 256)]
+    tiles = [np.full((512, 512), i + 1, np.float32) for i in range(len(tiles))]
     out = stitch(tiles, pos, h, w, 512)
-    assert out.min() > 0 and np.isfinite(out).all()
+    assert out[10, 10] == 1.0                      # tile 0 only
+    assert out[384, 384] == pytest.approx(2.5)     # all four: (1+2+3+4)/4
+    assert out[10, 300] == pytest.approx(1.5)      # tiles 0 and 1
+    assert out[300, 10] == pytest.approx(2.0)      # tiles 0 and 2
+    acc = np.zeros((h, w)); cnt = np.zeros((h, w))
+    for t, (y, x) in zip(tiles, pos):
+        acc[y:y + 512, x:x + 512] += t
+        cnt[y:y + 512, x:x + 512] += 1
+    np.testing.assert_allclose(out, acc / cnt, atol=1e-6)
+
+
+@pytest.mark.parametrize("stride", [0, -1, 513])
+def test_tile_positions_rejects_bad_stride(stride):
+    with pytest.raises(ValueError):
+        tile_positions(1024, 1024, 512, stride)
+
+
+def test_stitch_rejects_uncovered_pixels():
+    img = np.ones((1024, 1024), np.float32)
+    tiles, pos = tile_image(img, 512, 256)
+    with pytest.raises(ValueError):
+        stitch(tiles[1:], pos[1:], 1024, 1024, 512)
+
+
+@pytest.mark.parametrize("h,w", [(200, 200), (300, 700)])
+def test_padded_pixels_cannot_leak_into_output(h, w):
+    rng = np.random.default_rng(3)
+    img = rng.random((h, w)).astype(np.float32)
+    tiles, pos = tile_image(img, 512, 256)
+    leaked = []
+    for t, (y, x) in zip(tiles, pos):
+        t = t.copy()
+        t[max(h - y, 0):, :] = 1e6
+        t[:, max(w - x, 0):] = 1e6
+        leaked.append(t)
+    np.testing.assert_allclose(stitch(leaked, pos, h, w, 512), img, atol=1e-5)
 
 
 @pytest.mark.parametrize("h,w", [(1500, 1500), (600, 513), (300, 700), (200, 200)])
