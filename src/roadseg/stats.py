@@ -81,13 +81,14 @@ def two_level_bootstrap(R: np.ndarray, B: np.ndarray, n_boot: int = 10_000, seed
         mean_diff = float(np.nanmean(point))
         rng = np.random.default_rng(seed)
         out = np.empty(n_boot)
+        mean = np.mean if not (np.isnan(R).any() or np.isnan(B).any()) else np.nanmean
         for lo_i in range(0, n_boot, chunk):
             c = min(chunk, n_boot - lo_i)
             ri = rng.integers(0, sr, size=(c, sr))
             bi = rng.integers(0, sb, size=(c, sb))
-            d = np.nanmean(R[ri], axis=1) - np.nanmean(B[bi], axis=1)      # [c, N]
+            d = mean(R[ri], axis=1) - mean(B[bi], axis=1)      # [c, N]
             ii = rng.integers(0, N, size=(c, N))
-            out[lo_i:lo_i + c] = np.nanmean(np.take_along_axis(d, ii, axis=1), axis=1)
+            out[lo_i:lo_i + c] = mean(np.take_along_axis(d, ii, axis=1), axis=1)
     lo, hi = np.nanquantile(out, [alpha / 2, 1 - alpha / 2])
     return {"mean_diff": mean_diff, "ci_low": float(lo), "ci_high": float(hi),
             "p_value": _mc_p(out), "n_images": int(N), "n_seeds_rung": int(sr),
