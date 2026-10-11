@@ -134,21 +134,40 @@ Changing conv1 from 3 to 12 input channels discards its ImageNet weights. Left
 unhandled, R1 would lose several IoU to R0 for reasons having nothing to do with
 wavelets, and the comparison would be worthless.
 
-Adaptation: for each colour channel `c` with pretrained kernel `W[:, c]`,
+> **Amended 2026-10-11** after the Task 4 review. The original recipe below
+> ("zero") was claimed to make R1 equivalent to R0 at initialisation. It does
+> not, and an exact adaptation exists. The exact one is now the default.
 
-- `W'[:, 4c+0] = W[:, c] / 2` — the LL band, rescaled because orthonormal Haar
-  gives `LL ≈ 2 × local mean`.
-- `W'[:, 4c+1 : 4c+4] = 0` — the LH/HL/HH bands.
+**Default — exact adaptation (`hf_init="exact"`).** R0's stem computes
+`y[i,j] = Σ W[c,u,v] · x[c, 2i+u−3, 2j+v−3]`. Zero-padding the 7×7 kernel by one
+row on top and one column on the left makes its 8×8 support coincide with four
+whole 2×2 blocks per axis. Because Haar is orthonormal, the inner product of a
+kernel block with a pixel block equals the inner product of their transforms, so
+the equivalent kernel in the wavelet domain is simply **the DWT of the padded
+kernel**:
 
-Zero-initializing the high-frequency bands means **R1 begins training exactly
-equivalent to a pretrained R0 applied to a half-resolution image**, and can only
-depart from that by learning to use high-frequency content. This is the
-cleanest possible starting point for the comparison and is itself a result worth
-reporting. Gradients still flow to the zeroed weights (`dL/dW = grad_out ×
-input`, both nonzero), so they are not dead.
+```
+K  = pad(W, top=1, left=1)          # [64, 3, 8, 8]
+G  = DWT(K)                         # [64, 12, 4, 4]
+W' = zeros(64, 12, 7, 7);  W'[:, :, 1:5, 1:5] = G
+```
 
-A `--hf-init {zero,small-random}` flag exposes the alternative as a secondary
-ablation.
+With this initialisation **R1 is the same function as pretrained R0 at step 0**,
+borders included (verified numerically to ~1e-6). R1 can then depart from R0
+only by learning, within the larger function class its stem affords: a 7×7
+stride-1 kernel over 12 sub-band channels has a 14×14 pixel footprint and
+37,632 weights against R0's 9,408. That extra stem capacity *is* the paper's
+proposal, stated plainly: a DWT followed by a convolution is a reparameterised,
+larger strided convolution. R1 − R0 measures whether that helps.
+
+**Secondary — `hf_init="zero"`.** `W'[:, 4c] = W[:, c] / 2`, high-frequency
+bands zero. This is the pretrained kernel applied at stride 1 to a 2×2
+average-pooled image: every filter is retuned to half its spatial frequency and
+intra-block detail is invisible until the high-frequency weights train. It is
+*not* equivalent to R0 (stem feature cosine ≈ 0.62 at initialisation), so a
+difference measured under it mixes the operator with a pretrained-transfer
+mismatch. Kept as a flag because it is the adaptation a reader of the draft
+would most likely assume. `hf_init="small-random"` is likewise available.
 
 ### 5.5 Decoder
 
@@ -166,22 +185,61 @@ U-Net style, five stages, **explicit skip connections** — not the draft's
 Head: 1×1 conv → 1 logit channel. Sigmoid applied in the loss/metrics, not the
 model (numerical stability with `BCEWithLogitsLoss`).
 
-Upsampling operator is swappable: `bilinear + 3×3 conv` (R0, R1) or `IDWT`
-(R2, R3). For IDWT, a conv produces 4C channels which are then inverse-
-transformed to C channels at 2× resolution.
+Upsampling operator is swappable, and the two options differ **only in the 2×
+kernel** (amended 2026-10-11):
+
+- `bilinear` (R0, R1): fixed bilinear interpolation, then a 3×3 conv.
+- `wavelet` (R2, R3): `WaveletUnpool` — a per-channel learned 1→4 expansion
+  followed by the inverse DWT, i.e. a learned 2×2 synthesis filter, initialised
+  to nearest-neighbour — then **the same** 3×3 conv.
+
+The originally specified wavelet upsampler (a 1×1 conv to 4C channels, then
+IDWT) had 4/9 the parameters of the bilinear path's conv, 6.1M fewer across the
+decoder, and a different operation order. It would have confounded the operator
+with capacity in the opposite direction to the encoder. The amended version
+adds 4·C parameters per stage and nothing else.
 
 ### 5.6 R2 — wavelet downsampling throughout
 
-Every stride-2 operation in the encoder is replaced:
+> **Amended 2026-10-11** after the Task 4 review. The original design replaced
+> each stride-2 operation with a DWT followed by a *dense* 1×1 projection
+> (4C → C). Measured consequences: R2's encoder had 36.8M parameters against
+> R0's 23.0M (+60%); 2.75M pretrained shortcut weights were discarded; and the
+> new projections were randomly initialised inside a pretrained network, so
+> R2's features at initialisation had cosine similarity 0.40–0.54 to R0's
+> (R1: 0.90–0.96). R2 − R0 would have measured the operator, plus capacity,
+> plus lost pretraining.
 
-- stem maxpool → DWT (64 → 256 ch) then 1×1 conv back to 64
-- `layer{2,3,4}` first-block 3×3 grouped conv, stride 2 → DWT then stride-1 conv
-- the corresponding 1×1 stride-2 shortcut projections → DWT then stride-1 1×1
+Every stride-2 operation in the encoder is replaced by a `WaveletPool` placed
+**in front of the original pretrained layer**, whose stride is set to 1:
 
-All four sub-bands are retained (lossless), rather than keeping LL only. This
-is the version most likely to beat the baseline, and it is the honest framing
-of the wavelet argument: strided convolution and max-pooling discard
-high-frequency content irreversibly; Haar downsampling does not.
+`WaveletPool(C)` = DWT, then a depthwise 4→1 learned combination of each
+channel's own four sub-bands. It is a learned per-channel 2×2 analysis filter
+expressed in the Haar basis; it adds 4·C parameters and mixes no channels.
+
+| Replaced operation | Becomes | Initialised as | At init |
+|---|---|---|---|
+| stem maxpool 3×3 s2 | `WaveletPool(64)` | LL only (2×2 average) | approximate |
+| `layer{2,3,4}.0` grouped 3×3, s2 | `WaveletPool(C)` → same conv, s1 | LL only (2×2 average) | approximate |
+| `layer{2,3,4}.0` shortcut 1×1, s2 | `WaveletPool(C)` → same conv, s1 | (½,½,½,½) = top-left pixel | **exact** |
+
+All pretrained weights are kept, cardinality stays 32, and the encoder's
+parameter count differs from R0's by roughly 0.2%. All four sub-bands remain
+available to every downsampling step through learned weights, which is the
+honest form of the wavelet argument: strided convolution and max-pooling fix
+which high-frequency content is discarded; a learned combination of Haar
+sub-bands lets the network choose.
+
+What this version does **not** test is cross-channel mixing of sub-bands at the
+downsampling step. That is a legitimate, stronger model, but it cannot be
+separated from added capacity; if wanted it should be an explicit extra rung
+with a parameter-matched control, not a silent property of R2.
+
+**Seed pairing.** `WaveletPool` and `WaveletUnpool` are initialised
+deterministically and draw nothing from the random stream, and the decoder is
+constructed before the encoder. At a fixed seed every weight the rungs share is
+therefore identical across rungs, and R1's outputs equal R0's at step 0. Both
+properties are asserted by tests.
 
 ## 6. Data pipeline
 
