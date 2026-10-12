@@ -16,6 +16,7 @@ weight_decay: 1.0e-4
 warmup_epochs: 2          # linear warmup from 0.01*lr, then cosine to 0.01*lr, per iteration
 road_bias: 0.75
 amp: true                 # bf16 autocast
+cldice_weight: 0.5        # R3 only: loss = BCE + Dice + cldice_weight * (1 - soft-clDice)
 
 num_workers: 8            # DataLoader workers
 eval_workers: 8           # process pool for the per-image CPU metrics of the finish phase

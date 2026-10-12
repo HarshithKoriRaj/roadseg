@@ -142,8 +142,9 @@ def test_shipped_configs_resolve_their_base():
                     stride=256, val_stride=512, batch_size=16, lr=3.0e-4, weight_decay=1.0e-4,
                     warmup_epochs=2, road_bias=0.75, num_workers=8, amp=True, preload=True,
                     seed=0, runs_dir="/scratch/hk4488/roadseg/runs",
-                    ckpt_minutes=5)       # G7: the kill grace is 30 s; bound the loss by time
-    assert tr._DEFAULTS["ckpt_minutes"] == 5
+                    ckpt_minutes=5,       # G7: the kill grace is 30 s; bound the loss by time
+                    cldice_weight=0.5)    # W1: R3 = BCE + Dice + 0.5 * (1 - clDice)
+    assert tr._DEFAULTS["ckpt_minutes"] == 5 and tr._DEFAULTS["cldice_weight"] == 0.5
     for cfg in (mass, deep):
         assert {k: cfg[k] for k in expected} == expected
         assert isinstance(cfg["lr"], float) and isinstance(cfg["weight_decay"], float)
@@ -390,6 +391,29 @@ def test_rungs_and_baselines_are_paired_for_a_seed(tiny, monkeypatch):
     rec = _record_training(monkeypatch)
     assert tiny.train("--seed", "1") == 0
     assert set(rec["batches"]).isdisjoint(streams["R0"])
+
+
+def test_r3_trains_with_the_configured_cldice_weight_and_records_it(tiny, monkeypatch):
+    """W1. Only R3 uses clDice, with cfg['cldice_weight']; the weight is part of the recorded
+    configuration (and so of what a resume must match)."""
+    made = []
+    real = tr.ComboLoss
+
+    class Loss(real):
+        def __init__(self, use_cldice=False, cldice_weight=1.0):
+            made.append((use_cldice, cldice_weight))
+            super().__init__(use_cldice=use_cldice, cldice_weight=cldice_weight)
+
+    monkeypatch.setattr(tr, "ComboLoss", Loss)
+    cfg = tiny.cfg(epochs=1, cldice_weight=0.25)
+    assert tiny.train(cfg=cfg, name=("--rung", "R3")) == 0
+    assert tiny.train(cfg=cfg, name=("--rung", "R2")) == 0
+    assert tiny.train(cfg=cfg, name=("--model", "unet")) == 0
+    assert made == [(True, 0.25), (False, 0.25), (False, 0.25)]
+    for name in ("R3", "R2", "unet"):
+        assert read(tiny.runs / f"massachusetts_{name}_s0" / "metrics.json")["cfg"][
+            "cldice_weight"] == 0.25
+    assert tr.resolve_config(args_for(tiny.cfg(), "--rung", "R3"))["cldice_weight"] == 0.5
 
 
 def test_model_construction_is_seeded_immediately_before_build_model(tiny, monkeypatch):
@@ -1412,6 +1436,7 @@ def test_preflight_exercises_the_real_step_and_the_real_loss(tiny, monkeypatch):
     class Loss(real_loss):
         def __init__(self, use_cldice=False, **k):
             seen["loss"].append(use_cldice)
+            assert k == {"cldice_weight": 0.5}                     # W1: the configured weight
             super().__init__(use_cldice=use_cldice, **k)
 
     class Probe(Tiny):

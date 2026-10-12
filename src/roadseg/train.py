@@ -83,7 +83,7 @@ _REQUIRED = ("dataset", "data_root", "epochs", "tile", "stride", "val_stride", "
              "lr", "weight_decay", "warmup_epochs", "road_bias", "num_workers", "amp",
              "preload", "seed", "runs_dir")
 _DEFAULTS = {"model": "roadsegmenter", "rung": "R1", "pretrained": True, "hf_init": "exact",
-             "ckpt_minutes": 5, "eval_workers": 8,
+             "ckpt_minutes": 5, "eval_workers": 8, "cldice_weight": 0.5,
              "max_train_batches": None, "limit_train": None, "limit_val": None}
 # Keys that may differ between the process that wrote a checkpoint and the one resuming it:
 # they change how fast the run goes or where it lives, never what it computes.
@@ -729,7 +729,7 @@ def preflight(cfg: dict, device: str, use_amp: bool) -> dict:
     if is_cuda:
         torch.cuda.reset_peak_memory_stats()
     model = build_model({**cfg, "pretrained": False}).to(device)
-    loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"))
+    loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"), cldice_weight=cfg["cldice_weight"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                                   weight_decay=cfg["weight_decay"])
     batches = [{"image": torch.randn(b, 3, t, t, generator=g),
@@ -866,7 +866,8 @@ def main(argv=None) -> int:
     def build():
         set_seed(cfg["seed"])                  # immediately before build_model, nothing between
         model = build_model(cfg).to(device)
-        loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"))
+        # R3 = R2's loss (BCE + Dice) + cldice_weight * (1 - clDice); nothing else differs
+        loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"), cldice_weight=cfg["cldice_weight"])
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                                       weight_decay=cfg["weight_decay"])
         return model, loss_fn, optimizer

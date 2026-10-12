@@ -60,6 +60,34 @@ def soft_cl_dice_loss(
     return ((1 - dice) + (1 - cl_dice)).mean() * 0.5
 
 
+def cl_dice_term(pred: torch.Tensor, target: torch.Tensor, iters: int = 6,
+                 eps: float = 1e-6) -> torch.Tensor:
+    """ONLY the clDice term: per-sample `1 - clDice` from the soft skeletons, mean over the batch.
+
+    `pred` and `target` are (B, 1, H, W) in [0, 1]; `pred` must be post-sigmoid.
+    clDice = 2 * Tprec * Tsens / (Tprec + Tsens), with Tprec = |S(pred) * target| / |S(pred)|
+    and Tsens = |S(target) * pred| / |S(target)| -- the same quantities, skeleton iterations
+    and eps as `soft_cl_dice_loss` above, without that function's extra `0.5 * (1 - Dice)`:
+    rung R3 must differ from R2 by clDice alone (ComboLoss already has its Dice term).
+
+    Empty target (a crop with no road on valid pixels). S(target) is all zero, so Tsens = 0;
+    and S(pred) * target is all zero, so Tprec = 0 -- both EXACTLY, whatever is predicted.
+    Then clDice = 0 / eps = 0: the term is exactly 1, a constant, and its gradient is exactly
+    zero. clDice has nothing to say about a crop without roads and adds no pressure there --
+    in particular none toward predicting road; BCE and Dice alone push such a crop to
+    "predict nothing". (With B samples an empty one contributes the constant 1/B.)
+    """
+    if pred.min() < 0 or pred.max() > 1:
+        raise ValueError("cl_dice_term: pred must be in [0,1] (post-sigmoid)")
+    dims = (-1, -2, -3)
+    s_pred = soft_skeletonize(pred, iters=iters)
+    s_target = soft_skeletonize(target, iters=iters)
+    t_prec = (s_pred * target).sum(dim=dims) / (s_pred.sum(dim=dims) + eps)
+    t_sens = (s_target * pred).sum(dim=dims) / (s_target.sum(dim=dims) + eps)
+    cl_dice = 2 * t_prec * t_sens / (t_prec + t_sens + eps)
+    return (1 - cl_dice).mean()
+
+
 def dice_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None,
               eps: float = 1.0) -> torch.Tensor:
     """Soft Dice on logits, computed in fp32, optionally restricted to `valid` pixels.
@@ -82,7 +110,12 @@ def dice_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | 
 
 
 class ComboLoss(nn.Module):
-    """BCE + Dice, optionally + soft-clDice (rung R3), masked by `valid`.
+    """BCE + Dice, optionally + `cldice_weight` * (1 - soft-clDice) (rung R3), masked by `valid`.
+
+    `use_cldice=True` adds `cl_dice_term` and nothing else, so R3 - R2 is clDice alone.
+    (Until the final review this called the copied `soft_cl_dice_loss`, whose built-in
+    `0.5 * (1 - Dice)` made R3 "R2 + 0.5 clDice + 0.5 extra Dice". The experiment uses
+    `cldice_weight: 0.5`, the weight clDice carried there.)
 
     Takes **logits**. The clDice term needs probabilities, so the sigmoid is
     applied here — callers must never pre-activate. Always computed in fp32
@@ -110,5 +143,5 @@ class ComboLoss(nn.Module):
             prob = torch.sigmoid(logits)
             if valid is not None:
                 prob, target = prob * valid, target * valid
-            loss = loss + self.cldice_weight * soft_cl_dice_loss(prob, target)
+            loss = loss + self.cldice_weight * cl_dice_term(prob, target)
         return loss
