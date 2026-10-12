@@ -341,3 +341,121 @@ def test_table_has_no_primary_row_when_the_call_departs_from_the_plan(runs, caps
     out = _table(capsys, runs, "--allow-nonstandard").out
     assert _row_of(out, "R1").rstrip().endswith("(secondary)")
     assert not any(ln.rstrip().endswith("PRIMARY") for ln in out.splitlines())
+
+
+# ------------------------------------------------------ S2: the seed-paired t interval
+
+T975_DF2 = 4.302652729911275            # 97.5th percentile of Student t, 2 d.o.f. (tables: 4.303)
+
+
+def _hand_t(r):
+    """d = (0.02, 0.04, 0.06): mean 0.04, sd 0.02, se 0.02/sqrt(3), t = 2*sqrt(3), df 2.
+    For df = 2 the CDF is closed-form, F(t) = 1/2 + t / (2*sqrt(2 + t^2)), so the two-sided
+    p-value is 1 - t/sqrt(2 + t^2) = 1 - sqrt(12/14) = 0.07418."""
+    se = 0.02 / np.sqrt(3)
+    assert r["d"] == pytest.approx([0.02, 0.04, 0.06])
+    assert (r["n_seeds"], r["df"], r["alpha"]) == (3, 2, 0.05)
+    assert r["mean_diff"] == pytest.approx(0.04)
+    assert r["sd"] == pytest.approx(0.02) and r["se"] == pytest.approx(se)
+    assert r["t"] == pytest.approx(2 * np.sqrt(3))
+    assert r["ci_low"] == pytest.approx(0.04 - T975_DF2 * se)        # -0.00968
+    assert r["ci_high"] == pytest.approx(0.04 + T975_DF2 * se)       # +0.08968
+    assert r["p_value"] == pytest.approx(1 - np.sqrt(12 / 14))       # 0.07418
+    assert r["degenerate"] is False
+
+
+def test_seed_paired_t_matches_a_hand_computed_case():
+    r = stats.seed_paired_t([0.02, 0.04, 0.06], seeds=[0, 1, 2])
+    _hand_t(r)
+    assert r["seeds"] == [0, 1, 2]
+    assert round(r["ci_low"], 5) == -0.00968 and round(r["ci_high"], 5) == 0.08968
+    assert round(r["p_value"], 5) == 0.07418
+
+
+def test_seed_paired_t_agrees_with_scipy_one_sample_t():
+    from scipy.stats import ttest_1samp
+    d = [0.013, -0.004, 0.021, 0.008]
+    r, ref = stats.seed_paired_t(d), ttest_1samp(d, 0.0)
+    lo, hi = ref.confidence_interval(0.95)
+    assert r["t"] == pytest.approx(ref.statistic) and r["p_value"] == pytest.approx(ref.pvalue)
+    assert (r["ci_low"], r["ci_high"]) == pytest.approx((lo, hi)) and r["df"] == 3
+    assert r["seeds"] is None
+
+
+def test_seed_paired_t_needs_two_seeds():
+    assert stats.seed_paired_t([0.03]) is None and stats.seed_paired_t([]) is None
+
+
+def test_seed_paired_t_rejects_non_finite_differences():
+    with pytest.raises(ValueError, match="finite"):
+        stats.seed_paired_t([0.01, float("nan"), 0.02])
+    with pytest.raises(ValueError, match="seeds"):
+        stats.seed_paired_t([0.01, 0.02], seeds=[0])
+
+
+def test_seed_paired_t_with_identical_differences_is_flagged_not_infinite():
+    """Zero spread over seeds: t is +-inf and p is 0 in the limit; neither is reported."""
+    r = stats.seed_paired_t([0.05, 0.05, 0.05])
+    assert r["degenerate"] is True and r["t"] is None and r["p_value"] is None
+    assert r["mean_diff"] == r["ci_low"] == r["ci_high"] == pytest.approx(0.05)
+    assert r["sd"] == 0.0 and r["se"] == 0.0
+    json.dumps(r, allow_nan=False)
+    r = stats.seed_paired_t([0.0, 0.0])
+    assert r["degenerate"] is True and r["p_value"] is None and r["mean_diff"] == 0.0
+
+
+def _paired_seed_runs(root, shifts=(0.02, 0.04, 0.06), seed_effect=(0.0, 0.1, -0.1)):
+    """R1 - R0 = shifts[s] on every common image; each seed moves BOTH arms by seed_effect[s];
+    each arm also scored one image the other did not."""
+    ids = [f"img{i}" for i in range(len(BASE))]
+    for s, (shift, eff) in enumerate(zip(shifts, seed_effect)):
+        b = [v + eff for v in BASE]
+        _write_run(root, "R0", s, b + [0.0], 0.6, ids=ids + ["only_r0"])
+        _write_run(root, "R1", s, [v + shift for v in b] + [1.0], 0.6, ids=ids + ["only_r1"])
+
+
+def test_aggregate_seed_paired_t_uses_common_images_and_matches_hand_case(tmp_path):
+    _paired_seed_runs(tmp_path)
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    v = out["vs_baseline"]["R1"]
+    _hand_t(v["seed_paired_t"])
+    assert v["seed_paired_t"]["seeds"] == [0, 1, 2]
+    assert v["seed_paired_t"]["unpaired_seeds"] == {"rung": [], "baseline": []}
+    # seed_level is unchanged and is NOT this: it reads each run's own mean over its full image set
+    assert v["seed_level"]["mean_diff"] == pytest.approx((6 * 0.04 + 1.0) / 7)
+    # pairing removes the +-0.1 seed effect both arms share; the unpaired SE does not
+    assert v["seed_paired_t"]["se"] < v["seed_level"]["se"] / 5
+    assert not any("seed-paired" in w for w in out["warnings"])
+
+
+def test_aggregate_seed_paired_t_pairs_on_the_seeds_both_arms_have(tmp_path):
+    _paired_seed_runs(tmp_path)
+    d = tmp_path / "massachusetts_R1_s0"
+    res = json.loads((d / "test_metrics.json").read_text()); res["cfg"]["seed"] = 9
+    (d / "test_metrics.json").write_text(json.dumps(res)); d.rename(tmp_path / "massachusetts_R1_s9")
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    t = out["vs_baseline"]["R1"]["seed_paired_t"]
+    assert t["seeds"] == [1, 2] and t["n_seeds"] == 2 and t["df"] == 1
+    assert t["d"] == pytest.approx([0.04, 0.06]) and t["mean_diff"] == pytest.approx(0.05)
+    assert t["unpaired_seeds"] == {"rung": [9], "baseline": [0]}
+
+
+def test_aggregate_seed_paired_t_is_none_with_a_warning_below_two_common_seeds(runs):
+    import shutil
+    shutil.rmtree(runs / "massachusetts_R1_s1")
+    out = aggregate_runs(runs, "massachusetts", n_boot=200)
+    assert out["vs_baseline"]["R1"]["seed_paired_t"] is None
+    assert out["vs_baseline"]["R2"]["seed_paired_t"]["n_seeds"] == 2
+    assert [w for w in out["warnings"] if "seed-paired" in w and "R1" in w and "got 1" in w]
+
+
+def test_aggregate_seed_paired_t_drops_an_image_only_in_the_seed_where_it_is_nan(tmp_path):
+    """d_s is a mean of same-image differences: an image one arm could not score in seed 0
+    leaves that seed's mean, and stays in the other seeds'."""
+    ids = [f"img{i}" for i in range(4)]
+    for s in (0, 1):
+        _write_run(tmp_path, "R0", s, [0.5, 0.5, 0.5, 0.1], 0.6, ids=ids)
+    _write_run(tmp_path, "R1", 0, [0.6, 0.6, 0.6, float("nan")], 0.6, ids=ids)
+    _write_run(tmp_path, "R1", 1, [0.6, 0.6, 0.6, 0.9], 0.6, ids=ids)
+    t = aggregate_runs(tmp_path, "massachusetts", n_boot=200)["vs_baseline"]["R1"]["seed_paired_t"]
+    assert t["d"] == pytest.approx([0.1, (0.3 + 0.8) / 4])

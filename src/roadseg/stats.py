@@ -26,6 +26,7 @@ import warnings as _warnings
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import t as _student_t
 
 # Fixed before any test result was read. Do not edit after results exist: a change here is a
 # change of analysis plan and has to be reported as one.
@@ -147,6 +148,82 @@ def two_level_bootstrap(R: np.ndarray, B: np.ndarray, n_boot: int = 10_000, seed
             "alpha": float(alpha)}
 
 
+def seed_paired_t(d, seeds=None, alpha: float = 0.05) -> dict | None:
+    """Student t interval for the mean of per-seed paired differences `d[s]`.
+
+    Estimand: E_seed[d_s], the expected rung-minus-baseline difference of the two TRAINING
+    PROCEDURES on the scored image set, for a seed drawn at random. Seeds are paired by
+    design (a seed gives both arms the same crop stream and decoder/head initialisation),
+    so each d_s is one independent draw and whatever a seed does to both arms cancels in it.
+    The images are held fixed: the interval carries seed-to-seed variance only, and is the
+    counterpart of the two-level bootstrap, whose percentile interval is anti-conservative
+    when seed variance dominates and there are ~3 seeds. It assumes the d_s are i.i.d.
+    normal, which 3 values cannot check; with df = n - 1 = 2 the critical value is 4.30,
+    so the interval is wide by construction.
+
+    Returns mean, sd (ddof=1), se = sd/sqrt(n), t = mean/se, df = n - 1, the two-sided
+    p-value of H0: E[d_s] = 0 and the 1 - alpha interval mean +- t_{1-alpha/2, df} * se.
+    None when fewer than 2 differences. If the d_s are identical to rounding (sd <= 1e-12 of
+    the largest |d_s|) the t statistic is +-inf or 0/0: `degenerate` is True, the interval
+    collapses to the mean, and `t` and `p_value` are None rather than inf and 0.
+    """
+    d = np.asarray(d, float).ravel()
+    if seeds is not None and len(seeds) != len(d):
+        raise ValueError(f"seeds and d must be the same length, got {len(seeds)} and {len(d)}")
+    if not np.isfinite(d).all():
+        raise ValueError(f"per-seed differences must be finite, got {d.tolist()}")
+    n = len(d)
+    if n < 2:
+        return None
+    mean, sd = float(d.mean()), float(d.std(ddof=1))
+    degenerate = bool(sd <= 1e-12 * np.abs(d).max())
+    if degenerate:
+        sd = se = 0.0
+        t_stat = p = None
+        lo = hi = mean
+    else:
+        se = sd / float(np.sqrt(n))
+        t_stat = mean / se
+        half = float(_student_t.ppf(1 - alpha / 2, n - 1)) * se
+        lo, hi = mean - half, mean + half
+        p = float(2 * _student_t.sf(abs(t_stat), n - 1))
+    return {"mean_diff": mean, "ci_low": lo, "ci_high": hi, "p_value": p, "t": t_stat,
+            "df": n - 1, "sd": sd, "se": se, "n_seeds": n,
+            "seeds": None if seeds is None else [int(s) for s in seeds],
+            "d": d.tolist(), "alpha": float(alpha), "degenerate": degenerate}
+
+
+def _seed_diffs(R: np.ndarray, B: np.ndarray, r_seeds: list[int], b_seeds: list[int]) -> dict:
+    """{seed: d_s} over the seeds both arms have. R, B: [n_seeds, n_images], same image order.
+
+    d_s = mean_i(R[s, i] - B[s, i]) over the images both arms scored (finite) in seed s, i.e.
+    the difference of the two runs' per-image means over one and the same image set. NaN when
+    seed s has no such image.
+    """
+    out = {}
+    for s in sorted(set(r_seeds) & set(b_seeds)):
+        d = R[r_seeds.index(s)] - B[b_seeds.index(s)]
+        ok = np.isfinite(d)
+        out[s] = float(d[ok].mean()) if ok.any() else float("nan")
+    return out
+
+
+def _paired_t_block(R, B, r_seeds, b_seeds) -> tuple[dict | None, list[str]]:
+    """(seed_paired_t result with the seed bookkeeping, or None; what went wrong, if anything)."""
+    diffs = _seed_diffs(R, B, r_seeds, b_seeds)
+    used = {s: v for s, v in diffs.items() if np.isfinite(v)}
+    notes = [f"seed {s} has no image scored by both arms" for s in diffs if s not in used]
+    res = seed_paired_t(list(used.values()), seeds=list(used))
+    if res is None:
+        notes.append(f"seed-paired t interval needs at least 2 seeds common to both arms, got {len(used)}")
+        return None, notes
+    res["unpaired_seeds"] = {"rung": sorted(set(r_seeds) - set(used)),
+                             "baseline": sorted(set(b_seeds) - set(used))}
+    if res["degenerate"]:
+        notes.append("seed-paired differences are identical across seeds: t and p are undefined")
+    return res, notes
+
+
 def _load(path: Path) -> dict:
     try:
         return json.loads(path.read_text())
@@ -229,6 +306,12 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
     seed variance; crude with ~3 seeds). `image_level` is the specific-trained-models
     estimand (images only); `seed_level` gives per-seed means and a Welch-style SE.
 
+    `seed_paired_t` (secondary, reported beside the headline) is the t interval on the
+    per-seed differences d_s over the seeds both arms have, each d_s a mean over the image
+    ids common to both arms; see `seed_paired_t`. It is None, with a warning, below 2 such
+    seeds. Unlike `seed_level` it does not read each run's own `mean_<metric>`, which is
+    over that run's full image set.
+
     `analysis_plan` is `ANALYSIS_PLAN` verbatim, whatever the arguments. `primary` says
     whether THIS call is the pre-specified primary analysis; if it is, the plan's rung has
     `vs_baseline[rung]["role"] == "primary"`. Every other comparison, and every comparison
@@ -294,11 +377,14 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
         se = None
         if len(rs) > 1 and len(bs) > 1:
             se = float(np.sqrt(np.var(rs, ddof=1) / len(rs) + np.var(bs, ddof=1) / len(bs)))
+        paired_t, notes = _paired_t_block(R, Bm, rungs[rung]["seeds"], base_seeds)
+        warns.extend(f"{rung}: {n}" for n in notes)
         vs[rung] = {"n_images": len(common), "n_missing_ids": n_missing,
                     "n_dropped_nan": image_level["n_dropped"],
                     "image_level": image_level, "two_level": two_level,
                     "seed_level": {"rung": rs, "baseline": bs,
-                                   "mean_diff": float(np.mean(rs) - np.mean(bs)), "se": se}}
+                                   "mean_diff": float(np.mean(rs) - np.mean(bs)), "se": se},
+                    "seed_paired_t": paired_t}
     plan = ANALYSIS_PLAN["primary"]
     deviations = _plan_deviations(metric=metric, split=split, baseline=baseline, n_boot=n_boot,
                                   seed=seed, allow_nonstandard=allow_nonstandard, compared=set(vs))
