@@ -351,7 +351,10 @@ def _score(a, run: Path, device: str) -> int:
                          use_amp=cfg.get("amp"),     # same precision path that picked the threshold
                          on_prob=on_prob)
     agg.update(fixed_threshold_aggregate(rows))
-    standard = a.limit is None and a.tile == 512 and a.stride == 256
+    # "standard" = the whole split at the run's own geometry, the one its threshold was
+    # selected at (512 / 256 only for a cfg that predates recording them).
+    standard = (a.limit is None and a.tile == cfg.get("tile", 512)
+                and a.stride == cfg.get("stride", 256))
     ev = {"tile": a.tile, "stride": a.stride, "with_apls": not a.no_apls, "forced": a.force,
           "limit": a.limit, "checkpoint_epoch": ck.get("epoch"),
           "checkpoint_best_val": ck.get("best"),

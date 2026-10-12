@@ -716,12 +716,55 @@ def test_runs_aggregate_by_directory_name(tiny):
             assert tiny.train("--seed", seed, name=flag) == 0
             run = tiny.runs / f"massachusetts_{flag[1]}_s{seed}"
             assert ev.main(["--run", str(run), "--split", "test", *small]) == 0
-    with pytest.raises(ValueError, match="baseline"):                # tile 32 is not the protocol
-        aggregate_runs(tiny.runs, "massachusetts", n_boot=50)
-    out = aggregate_runs(tiny.runs, "massachusetts", n_boot=50, allow_nonstandard=True)
+            assert read(run / "test_metrics.json")["protocol"] == "standard"   # W5: the run's own
+    out = aggregate_runs(tiny.runs, "massachusetts", n_boot=50)      # tile and stride (32 / 16)
     assert sorted(out["rungs"]) == ["R0", "R1", "unet"]
     assert all(r["seeds"] == [0, 1] for r in out["rungs"].values())
     assert sorted(out["vs_baseline"]) == ["R1", "unet"]
+    for seed in ("0", "1"):                                          # R0 re-scored off-protocol
+        run = tiny.runs / f"massachusetts_R0_s{seed}"
+        assert ev.main(["--run", str(run), "--split", "test", "--force", "--tile", "32",
+                        "--stride", "32", "--workers", "0"]) == 0
+        assert read(run / "test_metrics.json")["protocol"] == "nonstandard"
+    with pytest.raises(ValueError, match="baseline"):                # ... is not aggregated
+        aggregate_runs(tiny.runs, "massachusetts", n_boot=50)
+    out = aggregate_runs(tiny.runs, "massachusetts", n_boot=50, allow_nonstandard=True)
+    assert sorted(out["rungs"]) == ["R0", "R1", "unet"]
+
+
+def test_protocol_is_standard_only_at_the_runs_own_tile_and_stride_without_a_limit(tiny):
+    """W5. 'standard' used to mean the literals 512/256; it means cfg['tile'] / cfg['stride']
+    -- the geometry the threshold was selected at -- and every image of the split."""
+    assert tiny.train() == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+
+    def protocol(*flags):
+        assert ev.main(["--run", str(run), "--split", "val", "--workers", "0", "--no-apls",
+                        *flags]) == 0
+        return read(run / "val_metrics.json")["protocol"]
+
+    assert protocol("--tile", "32", "--stride", "16") == "standard"
+    assert protocol("--tile", "32", "--stride", "32") == "nonstandard"
+    assert protocol("--tile", "64", "--stride", "16") == "nonstandard"
+    assert protocol("--tile", "32", "--stride", "16", "--limit", "1") == "nonstandard"
+    assert protocol() == "nonstandard"                   # the CLI defaults 512 / 256: not this run's
+
+
+def test_recorded_pretrained_says_what_happened_for_the_baselines(tiny):
+    """W5. U-Net loads no pretrained weights whatever the config says; record that."""
+    def pretrained(*flags):
+        return tr.resolve_config(args_for(tiny.cfg(), *flags))["pretrained"]
+
+    assert pretrained("--model", "unet") is False
+    assert pretrained("--model", "dlinknet") is True
+    assert pretrained("--model", "dlinknet", "--no-pretrained") is False
+    assert pretrained("--rung", "R0") is True and pretrained("--rung", "R0", "--no-pretrained") is False
+    for dataset in ("massachusetts", "deepglobe"):       # the shipped configs
+        cfg = tr.resolve_config(args_for(ROOT / f"configs/{dataset}.yaml", "--model", "unet"))
+        assert cfg["pretrained"] is False and pv.pretrained_file(cfg) is None
+    assert tiny.train(name=("--model", "unet")) == 0
+    m = read(tiny.runs / "massachusetts_unet_s0" / "metrics.json")
+    assert m["cfg"]["pretrained"] is False and m["environment"]["pretrained_sha256"] is None
 
 
 def test_training_never_opens_the_test_split(tmp_path, monkeypatch):

@@ -182,6 +182,8 @@ def resolve_config(args, error=None) -> dict:
         if args.rung is not None:
             fail(f"--rung applies to roadsegmenter only, not to the {model} baseline")
         rung, name = None, model
+        if model == "unet":
+            cfg["pretrained"] = False      # it has no pretrained weights: record what happened
     else:
         fail(f"unknown model {model!r}; expected roadsegmenter or one of {list(BASELINES)}")
     cfg.update(model=model, rung=rung, name=name)
