@@ -12,6 +12,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import socket
 import subprocess
 import sys
 import warnings
@@ -29,10 +30,34 @@ from .engine import load_checkpoint
 from .image_metrics import image_metrics
 from .metrics import confusion, metrics_from_confusion
 from .models.segmenter import build_model
-from .runtime import run_cli
+from .runtime import PreflightFailed, run_cli
 
 _COUNTS = ("tp", "fp", "fn", "tn")
 _ROW_NONMETRIC = ("id", "n_valid", "tp", "fp", "fn", "n_gt", "n_pred")
+
+
+def resolve_device(requested: str | None) -> str:
+    """The device to run on. None (interactive use) picks cuda when there is one, else cpu.
+
+    An EXPLICIT cuda device never falls back: on a node whose GPU is broken the job
+    must fail at once (PreflightFailed, exit code 3), not compute on the CPU for a day.
+    """
+    if requested is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    requested = str(requested)
+    if requested.startswith("cuda"):
+        where = (f"on {socket.gethostname()} "
+                 f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')})")
+        if not torch.cuda.is_available():
+            raise PreflightFailed(f"--device {requested} was requested but torch.cuda."
+                                  f"is_available() is False {where}. Will not fall back to "
+                                  f"the CPU.")
+        index = torch.device(requested).index
+        if index is not None and index >= torch.cuda.device_count():
+            raise PreflightFailed(f"--device {requested} was requested but only "
+                                  f"{torch.cuda.device_count()} CUDA device(s) exist {where}. "
+                                  f"Will not fall back to another device.")
+    return requested
 
 
 @torch.no_grad()
@@ -212,6 +237,9 @@ def main(argv=None) -> int:
     ap.add_argument("--stride", type=int, default=256)
     ap.add_argument("--limit", type=int, default=None, help="first N images only (smoke use)")
     ap.add_argument("--workers", type=int, default=8, help="CPU metric processes (0 = in-process)")
+    ap.add_argument("--device", default=None,
+                    help="default: cuda if available, else cpu. An explicit cuda device never "
+                         "falls back to the CPU (exit 3 if CUDA is unavailable)")
     a = ap.parse_args(argv)
 
     run = Path(a.run)
@@ -223,13 +251,13 @@ def main(argv=None) -> int:
               f"pass --force to re-score (the old file is kept as .superseded.json).",
               file=sys.stderr)
         return 2
+    device = resolve_device(a.device)              # before anything is read or written
 
     meta = json.loads((run / "metrics.json").read_text())
     cfg, threshold = meta["cfg"], float(meta["threshold"])
     if "data_root" not in cfg:
         raise KeyError("cfg has no 'data_root'; refusing to guess a cwd-relative data location")
     model_cfg = {**cfg, "pretrained": False}       # weights come from the checkpoint
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(model_cfg).to(device)
     ck = load_checkpoint(run / "best.pt", model, map_location=device) or {}
     dataset = RoadFullDataset(cfg["data_root"], cfg["dataset"], a.split)

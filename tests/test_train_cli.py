@@ -1143,10 +1143,10 @@ def test_wrapper_runs_train_then_scores_the_test_split(tmp_path):
     rc, log, out = _wrapper(tmp_path, {})
     assert rc == 0, out
     run = tmp_path / "runs" / "massachusetts_R1_s1"
-    assert log == [
+    assert log == [                                    # G3: both steps name the GPU explicitly
         f"train argv -m roadseg.train --config configs/massachusetts.yaml --rung R1 --seed 1 "
-        f"--resume auto --runs-dir {tmp_path / 'runs'}",
-        f"eval argv -m roadseg.eval --run {run} --split test --workers 8"]
+        f"--resume auto --runs-dir {tmp_path / 'runs'} --device cuda",
+        f"eval argv -m roadseg.eval --run {run} --split test --workers 8 --device cuda"]
     assert "task 4 -> dataset=massachusetts name=R1 seed=1" in out
     rc, log, out = _wrapper(tmp_path, {}, task=33)                 # a baseline uses --model
     assert rc == 0, out
@@ -1274,6 +1274,41 @@ def test_cli_rejects_unknown_rung_subprocess():
                         str(ROOT / "configs/deepglobe.yaml"), "--rung", "R9", "--dry-run"],
                        capture_output=True, text=True, env=ENV, cwd=ROOT)
     assert r.returncode != 0 and "unknown rung" in r.stderr
+
+
+def test_an_explicit_cuda_device_never_falls_back_to_cpu(tiny, monkeypatch, capsys):
+    """G3. A node with a broken GPU must fail the task at once, not train on CPU for 24 h."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(tr.PreflightFailed, match="cuda.*is_available.*False.*not fall"):
+        tr.main(["--config", str(tiny.cfg()), "--rung", "R1", "--device", "cuda"])
+    with pytest.raises(tr.PreflightFailed, match="not fall"):
+        tr.main(["--config", str(tiny.cfg()), "--rung", "R1", "--device", "cuda:0", "--dry-run"])
+    assert not tiny.runs.exists()                                   # nothing written
+    assert tr.resolve_device(None) == "cpu" and tr.resolve_device("cpu") == "cpu"   # unchanged
+
+    assert tiny.train() == 0                                        # a finished run, on CPU
+    run = tiny.runs / "massachusetts_R1_s0"
+    before = sorted(p.name for p in run.iterdir())
+    with pytest.raises(tr.PreflightFailed, match="not fall"):
+        ev.main(["--run", str(run), "--split", "test", "--tile", "32", "--stride", "16",
+                 "--workers", "0", "--device", "cuda"])
+    assert sorted(p.name for p in run.iterdir()) == before          # no result, no temp file
+
+
+@pytest.mark.parametrize("module", ["roadseg.train", "roadseg.eval"])
+def test_cli_with_device_cuda_exits_3_without_a_gpu(tmp_path, module):
+    """The real CLIs, CUDA hidden: exit code 3 (never requeued by the wrapper), clear message."""
+    runs = tmp_path / "runs"
+    if module == "roadseg.train":
+        cfg = write_cfg(tmp_path, tmp_path / "no-data-needed")
+        args = ["--config", str(cfg), "--rung", "R1", "--resume", "auto", "--device", "cuda"]
+    else:
+        args = ["--run", str(runs / "massachusetts_R1_s0"), "--split", "test", "--device", "cuda"]
+    r = subprocess.run([sys.executable, "-m", module, *args], capture_output=True, text=True,
+                       env=dict(ENV, CUDA_VISIBLE_DEVICES=""), cwd=ROOT)
+    assert r.returncode == tr.EXIT_PREFLIGHT == 3, r.stdout + r.stderr
+    assert "preflight failed: --device cuda" in r.stderr and "is_available() is False" in r.stderr
+    assert "Traceback" not in r.stderr and not runs.exists()
 
 
 def _memory_limit_gib() -> float:

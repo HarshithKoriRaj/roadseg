@@ -171,7 +171,7 @@ cd "$PROJECT"
 
 # ---- 1. train ----------------------------------------------------------------------------
 run_step "$PY" -m roadseg.train --config "configs/${DATASET}.yaml" "${SELECT[@]}" \
-    --seed "$SEED" --resume auto --runs-dir "$RUNS"
+    --seed "$SEED" --resume auto --runs-dir "$RUNS" --device cuda
 echo "train exited with $STEP_RC"
 if (( got_term )); then
     terminated "training"
@@ -190,7 +190,7 @@ fi
 
 # ---- 2. score the test split, once -------------------------------------------------------
 rm -f "$RUN"/.test_metrics.json.*.tmp       # left behind if an earlier scoring was killed
-run_step "$PY" -m roadseg.eval --run "$RUN" --split test --workers 8
+run_step "$PY" -m roadseg.eval --run "$RUN" --split test --workers 8 --device cuda
 echo "eval exited with $STEP_RC"
 if (( STEP_RC == 0 )); then
     echo "DONE $RUN"

@@ -58,7 +58,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .data.dataset import RoadFullDataset, RoadTileDataset
 from .engine import load_checkpoint, save_checkpoint, train_one_epoch
-from .eval import evaluate, select_threshold
+from .eval import evaluate, resolve_device, select_threshold
 from .losses import ComboLoss
 from .models.segmenter import build_model
 from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
@@ -114,7 +114,9 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--workers", type=int, default=None,
                     help="DataLoader workers; also caps the metric process pool (0 = all in-process)")
     ap.add_argument("--runs-dir", default=None)
-    ap.add_argument("--device", default=None, help="default: cuda if available, else cpu")
+    ap.add_argument("--device", default=None,
+                    help="default: cuda if available, else cpu. An explicit cuda device never "
+                         "falls back to the CPU (exit 3 if CUDA is unavailable)")
     ap.add_argument("--no-preload", action="store_true")
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--no-pretrained", action="store_true")
@@ -614,7 +616,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     cfg = resolve_config(args, error=ap.error)
     run = Path(cfg["runs_dir"]) / run_name(cfg)
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)       # an explicit cuda never falls back to the CPU
     is_cuda = str(device).startswith("cuda")
     use_amp = bool(cfg["amp"])
     print(f"rung={cfg['rung'] or '-'} seed={cfg['seed']} dataset={cfg['dataset']} "
