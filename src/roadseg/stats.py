@@ -259,7 +259,7 @@ def pooled_iou_bootstrap(rung: dict, base: dict, n_boot: int = 10_000, seed: int
             n_empty += int(((ur == 0).any(axis=1) | (ub == 0).any(axis=1)).sum())
             out[lo_i:lo_i + c] = (np.nanmean(np.take_along_axis(qr, ri, axis=1), axis=1)
                                   - np.nanmean(np.take_along_axis(qb, bi, axis=1), axis=1))
-    lo, hi = np.nanquantile(out, [alpha / 2, 1 - alpha / 2])
+        lo, hi = np.nanquantile(out, [alpha / 2, 1 - alpha / 2])
     return {"mean_diff": point, "ci_low": float(lo), "ci_high": float(hi), "p_value": _mc_p(out),
             "rung": {"mean": float(np.nanmean(pr)), "per_seed": pr.tolist()},
             "baseline": {"mean": float(np.nanmean(pb)), "per_seed": pb.tolist()},
