@@ -667,6 +667,20 @@ def test_pooled_iou_is_skipped_for_the_rung_whose_runs_lack_one_count(tmp_path):
     assert [w for w in out["warnings"] if "pooled_iou skipped for R2:" in w and "fp" in w]
 
 
+def test_unusable_counts_cost_the_pooled_analysis_not_the_summary(tmp_path):
+    """A corrupt secondary field must not take the primary result down with it."""
+    for s in (0, 1):
+        rows = [_img("a", 100, 0.5), _img("b", 300, 0.6), _img("c", 200, 0.7)]
+        _write_rows(tmp_path, "R0", s, rows)
+        _write_rows(tmp_path, "R1", s, [dict(r, fp=-1) if s else r for r in rows])
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    v = out["vs_baseline"]["R1"]
+    assert v["pooled_iou"] is None and "non-negative" in v["skipped"]["pooled_iou"]
+    assert v["two_level"]["mean_diff"] == 0.0 and v["two_level"]["n_images"] == 3
+    assert v["seed_paired_t"] is not None and len(v["n_gt_floors"]) == 4
+    assert [w for w in out["warnings"] if w.startswith("pooled_iou skipped for R1:") and "rung counts" in w]
+
+
 def test_pooled_iou_bootstrap_speed_at_the_real_size():
     import time
     rng = np.random.default_rng(0)
@@ -845,3 +859,122 @@ def test_a_floor_that_leaves_fewer_than_two_images_reports_none(runs):
     for f in (mid, hi):
         assert f["n_excluded"] == 6 and f["n_kept"] == 0
         assert f["two_level"] is None and f["seed_paired_t"] is None and "at least 2" in f["note"]
+
+
+# ------------------------------------------------------------- S5: output and CLI
+
+OLD_KEYS = {"n_images", "n_missing_ids", "n_dropped_nan", "image_level", "two_level", "seed_level"}
+NEW_KEYS = {"role", "seed_paired_t", "pooled_iou", "n_gt_floors", "top_images", "iou_at_0.5",
+            "pooled_iou_at_0.5", "skipped"}
+
+
+def _robustness(text, rung):
+    """The lines of one rung's robustness block, keyed by their label."""
+    lines = text.splitlines()
+    start = [i for i, ln in enumerate(lines) if ln.startswith(f"-- {rung} vs ")]
+    assert len(start) == 1, f"one robustness block per rung; {rung}: {start}"
+    block = []
+    for ln in lines[start[0] + 1:]:
+        if not ln.startswith("   "):
+            break
+        block.append(ln)
+    return lines[start[0]], block
+
+
+def _line(block, label):
+    hit = [ln for ln in block if ln.strip().startswith(label + " ")]
+    assert len(hit) == 1, f"{label!r}: {hit} in {block}"
+    return hit[0]
+
+
+def test_summary_json_gains_the_new_blocks_and_keeps_the_old_ones(tmp_path, capsys):
+    _flip_runs(tmp_path)
+    _table(capsys, tmp_path)
+    summary = json.loads((tmp_path / "massachusetts_test_summary.json").read_text())
+    assert {"dataset", "split", "metric", "baseline", "headline", "rungs", "vs_baseline", "warnings",
+            "analysis_plan", "primary"} == set(summary)
+    assert summary["headline"] == "two_level" and summary["analysis_plan"] == stats.ANALYSIS_PLAN
+    v = summary["vs_baseline"]["R1"]
+    assert set(v) == OLD_KEYS | NEW_KEYS and v["role"] == "primary"
+    assert all(v[k] is not None for k in NEW_KEYS)
+    assert summary == json.loads(json.dumps(aggregate_runs(tmp_path, "massachusetts")))
+
+
+def test_table_is_one_line_per_rung_then_a_robustness_block_per_comparison(tmp_path, capsys):
+    _flip_runs(tmp_path)
+    out = _table(capsys, tmp_path).out
+    v = json.loads((tmp_path / "massachusetts_test_summary.json").read_text())["vs_baseline"]["R1"]
+    row = _row_of(out, "R1")                                    # still exactly one table line
+    assert f"{v['two_level']['mean_diff']:+.4f}" in row and row.rstrip().endswith("PRIMARY")
+    assert out.index("robustness") > out.index(row)
+    head, block = _robustness(out, "R1")
+    assert "R0" in head and "PRIMARY" in head
+    t = v["seed_paired_t"]
+    ln = _line(block, "seed-paired t")
+    assert f"{t['mean_diff']:+.4f} [{t['ci_low']:+.4f},{t['ci_high']:+.4f}] p={t['p_value']:.4f}" in ln
+    assert "df=2" in ln and "+0.0933 +0.0933 +0.0100" in ln      # the three d_s
+    p = v["pooled_iou"]
+    assert f"{p['mean_diff']:+.4f} [{p['ci_low']:+.4f},{p['ci_high']:+.4f}]" in _line(block, "pooled IoU")
+    assert f"{v['iou_at_0.5']['two_level']['mean_diff']:+.4f}" in _line(block, "IoU@0.5")
+    assert f"{v['pooled_iou_at_0.5']['mean_diff']:+.4f}" in _line(block, "pooled IoU@0.5")
+    for f in v["n_gt_floors"][1:]:
+        ln = _line(block, f"n_gt>={f['n_gt_floor']}")
+        assert f"-{f['n_excluded']} img" in ln and f"{f['two_level']['mean_diff']:+.4f}" in ln
+        assert f"[{f['seed_paired_t']['ci_low']:+.4f},{f['seed_paired_t']['ci_high']:+.4f}]" in ln
+    top = _line(block, "top-5 images")
+    assert "94.9%" in top and "tiny(n_gt=3) +0.6667" in top and "large3" in top and "large4" not in top
+    assert "skipped" not in "".join(block)
+
+
+def test_table_prints_every_comparison_as_secondary_except_the_primary(tmp_path, capsys):
+    _huge_and_small(tmp_path)                                   # rungs big and small, no R1
+    out = _table(capsys, tmp_path).out
+    for rung in ("big", "small"):
+        assert _row_of(out, rung).rstrip().endswith("(secondary)")
+        assert "secondary" in _robustness(out, rung)[0]
+    assert "NO PRIMARY ROW" in out
+
+
+def test_table_says_what_was_skipped_for_older_result_files(runs, capsys):
+    """Rows with only id / iou / n_gt: every new analysis that cannot run says so; no crash."""
+    out = _table(capsys, runs).out
+    _, block = _robustness(out, "R1")
+    assert "n/a" in _line(block, "pooled IoU") and "n/a" in _line(block, "IoU@0.5")
+    assert "n/a" in _line(block, "pooled IoU@0.5")
+    assert "n/a" in _line(block, "n_gt>=500") and "-6 img" in _line(block, "n_gt>=500")
+    assert "p=n/a" in _line(block, "seed-paired t")              # R1 = R0 + 0.05 in both seeds: no spread
+    skipped = _line(block, "skipped")
+    assert "pooled_iou" in skipped and "iou_at_0.5" in skipped and "pooled_iou_at_0.5" in skipped
+    assert "WARNING: pooled_iou skipped for R1, R2" in out
+    summary = json.loads((runs / "massachusetts_test_summary.json").read_text())
+    assert summary["vs_baseline"]["R1"]["image_level"]["mean_diff"] == pytest.approx(0.05)
+
+
+def test_table_columns_fit_a_long_baseline_name(tmp_path, capsys):
+    for s in (0, 1):
+        _write_run(tmp_path, "R0", s, BASE, 0.6)
+        _write_run(tmp_path, "deeplabv3plus", s, BASE, 0.6, cfg_extra={"model": "deeplabv3plus"})
+    lines = _table(capsys, tmp_path).out.splitlines()
+    head = next(ln for ln in lines if ln.startswith("rung "))
+    rows = [_row_of("\n".join(lines), r) for r in ("R0", "deeplabv3plus")]
+    assert head.index("seeds") + len("seeds") == rows[0].index(" 2 ") + 2 == rows[1].index(" 2 ") + 2
+
+
+def test_table_survives_a_single_seed_rung(runs, capsys):
+    import shutil
+    shutil.rmtree(runs / "massachusetts_R1_s1")
+    out = _table(capsys, runs).out
+    assert "n/a" in _line(_robustness(out, "R1")[1], "seed-paired t")
+    assert "seed-paired t interval needs at least 2 seeds" in out
+
+
+def test_json_only_writes_the_same_summary_and_prints_no_table(tmp_path, capsys):
+    _flip_runs(tmp_path, at05=False)
+    _table(capsys, tmp_path)
+    f = tmp_path / "massachusetts_test_summary.json"
+    full = f.read_text(); f.unlink()
+    io = _table(capsys, tmp_path, "--json-only")
+    assert f.read_text() == full
+    assert io.out.splitlines() == [f"wrote {f}"]
+    # nothing is lost: what the table would have warned about goes to stderr
+    assert "WARNING: iou_at_0.5 skipped for R1" in io.err and "robustness" not in io.err

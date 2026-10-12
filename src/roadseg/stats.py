@@ -15,6 +15,13 @@ Two different estimands are reported by `aggregate_runs`:
 The analysis is pre-specified: `ANALYSIS_PLAN` was committed before any test-split
 result existed and is copied verbatim into every summary. One comparison is primary;
 every other number this module prints is secondary and says so.
+
+Secondary, reported beside the headline for every rung vs the baseline:
+  * seed_paired_t: Student t interval on the per-seed paired differences (seed variance
+    only, images fixed) -- the check on the two-level interval when seeds are few.
+  * pooled_iou: difference in pooled IoU (ratio of pixel sums), own two-level bootstrap.
+  * n_gt_floors, top_images, iou_at_0.5, pooled_iou_at_0.5: how much of the difference
+    rests on near-empty images and on the validation-selected threshold.
 """
 from __future__ import annotations
 
@@ -22,6 +29,7 @@ import argparse
 import copy
 import json
 import re
+import sys
 import warnings as _warnings
 from pathlib import Path
 
@@ -628,7 +636,8 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
         se = None
         if len(rs) > 1 and len(bs) > 1:
             se = float(np.sqrt(np.var(rs, ddof=1) / len(rs) + np.var(bs, ddof=1) / len(bs)))
-        paired_t, notes = _paired_t_block(R, Bm, rungs[rung]["seeds"], base_seeds)
+        r_seeds = rungs[rung]["seeds"]
+        paired_t, notes = _paired_t_block(R, Bm, r_seeds, base_seeds)
         warns.extend(f"{rung}: {n}" for n in notes)
         skipped: dict[str, str] = {}
         arms = [rows[rung], rows[baseline]]
@@ -640,10 +649,10 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
                 return None
             try:
                 return pooled_iou_bootstrap(*counts, n_boot=n_boot, seed=seed)
-            except ValueError as e:
-                raise ValueError(f"{rung} vs {baseline}, {analysis}: {e}") from e
+            except ValueError as e:        # unusable counts: lose this secondary analysis, loudly,
+                skipped[analysis] = str(e)  # not the whole summary with the primary result in it
+                return None
 
-        r_seeds = rungs[rung]["seeds"]
         n_gt, why = _common_n_gt(arms, common)
         if n_gt is None:
             floors, skipped["n_gt_floors"] = None, why
@@ -688,37 +697,71 @@ def _fmt(x) -> str:
     return "   n/a" if x is None else f"{x:6.4f}"
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Aggregate per-seed run metrics per rung.")
-    ap.add_argument("--runs-dir", required=True)
-    ap.add_argument("--dataset", required=True)
-    ap.add_argument("--split", default="test")
-    ap.add_argument("--metric", default="iou")
-    ap.add_argument("--baseline", default="R0")
-    ap.add_argument("--allow-nonstandard", action="store_true",
-                    help="include runs scored with --limit / non-default tiling (smoke tests)")
-    a = ap.parse_args(argv)
-    out = aggregate_runs(a.runs_dir, a.dataset, a.split, a.metric, a.baseline,
-                         allow_nonstandard=a.allow_nonstandard)
-    path = Path(a.runs_dir) / f"{a.dataset}_{a.split}_summary.json"
-    path.write_text(json.dumps(out, indent=2))
+def _iv(tag: str, b: dict | None) -> str:
+    """'tag +diff [low,high] p=...' for a result with an interval; 'tag n/a' if not computed."""
+    if b is None:
+        return f"{tag} n/a"
+    p = "n/a" if b["p_value"] is None else f"{b['p_value']:.4f}"
+    return f"{tag} {b['mean_diff']:+.4f} [{b['ci_low']:+.4f},{b['ci_high']:+.4f}] p={p}"
 
-    pk, mk = f"dataset_{a.metric}", f"mean_{a.metric}"
-    pm = lambda m: f"{_fmt(m.get('mean'))}+-{_fmt(m.get('std')).strip()}"
-    plan = out["analysis_plan"]
-    print(f"{a.dataset} / {a.split}: headline = two-level bootstrap vs {a.baseline} on {a.metric}")
+
+def _robustness_lines(rung: str, baseline: str, v: dict) -> list[str]:
+    """The compact robustness block of one comparison. boot = two-level bootstrap (percentile
+    interval), t = seed-paired t interval. Floor 0 is the table row itself and is not repeated."""
+    def line(label, *parts):
+        return f"    {label:<22} " + "  ".join(parts)
+
+    def pct(x):
+        return "n/a" if x is None else f"{100 * x:.1f}%"
+
+    role = ("robustness of the PRIMARY row; each line below is secondary" if v["role"] == "primary"
+            else "secondary")
+    t = v["seed_paired_t"]
+    out = [f"-- {rung} vs {baseline} ({role})",
+           line("seed-paired t", _iv("t", t) + ("" if t is None else f"  df={t['df']}  d_s "
+                                                + " ".join(f"{d:+.4f}" for d in t["d"]))),
+           line("pooled IoU", _iv("boot", v["pooled_iou"]))]
+    fixed = v["iou_at_0.5"] or {}
+    out.append(line("IoU@0.5", _iv("boot", fixed.get("two_level")), _iv("t", fixed.get("seed_paired_t"))))
+    out.append(line("pooled IoU@0.5", _iv("boot", v["pooled_iou_at_0.5"])))
+    if v["n_gt_floors"] is None:
+        out.append(line("n_gt floors", "n/a"))
+    for f in (v["n_gt_floors"] or [])[1:]:
+        out.append(line(f"n_gt>={f['n_gt_floor']} (-{f['n_excluded']} img)",
+                        _iv("boot", f["two_level"]), _iv("t", f["seed_paired_t"])))
+    top = v["top_images"]
+    out.append(line(f"top-{top['k']} images",
+                    f"{pct(top['share_of_mean_diff'])} of the difference, "
+                    f"{pct(top['share_of_abs_diff'])} of |differences|: "
+                    + "; ".join(f"{i['id']}(n_gt={'n/a' if i['n_gt'] is None else i['n_gt']}) "
+                                f"{i['diff']:+.4f}" for i in top["images"])))
+    if v["skipped"]:
+        out.append(line("skipped", "; ".join(f"{k} ({why})" for k, why in v["skipped"].items())))
+    return out
+
+
+def format_table(out: dict) -> list[str]:
+    """The printed report for one `aggregate_runs` result: the plan, one line per rung with
+    the headline columns and its role, then a robustness block per comparison, then warnings."""
+    metric, baseline, plan = out["metric"], out["baseline"], out["analysis_plan"]
+    pk, mk = f"dataset_{metric}", f"mean_{metric}"
+
+    def pm(m):
+        return f"{_fmt(m.get('mean'))}+-{_fmt(m.get('std')).strip()}"
+
+    lines = [f"{out['dataset']} / {out['split']}: headline = two-level bootstrap vs {baseline} on {metric}"]
     if out["primary"]["conforms_to_plan"]:
-        print(f"PRIMARY (pre-specified): {plan['primary']['comparison']}, "
-              f"{plan['primary']['metric_definition']}, {plan['primary']['method']}")
+        lines.append(f"PRIMARY (pre-specified): {plan['primary']['comparison']}, "
+                     f"{plan['primary']['metric_definition']}, {plan['primary']['method']}")
     else:
-        print(f"NO PRIMARY ROW: this call is not the pre-specified analysis "
-              f"({'; '.join(out['primary']['deviations'])})")
-    print(plan["secondary"])
-    print(plan["coverage_note"])
-    print(f"{'rung':5} {'seeds':>5} {'pooled':>15} {'per-image':>15} {'diff':>8} "
-          f"{'95% CI':>18} {'p':>7} {'n_img':>6}")
+        lines.append("NO PRIMARY ROW: this call is not the pre-specified analysis "
+                     f"({'; '.join(out['primary']['deviations'])})")
+    w = max([5] + [len(r) for r in out["rungs"]])                 # baselines have longer names
+    lines += [plan["secondary"], plan["coverage_note"],
+              f"{'rung':{w}} {'seeds':>5} {'pooled':>15} {'per-image':>15} {'diff':>8} "
+              f"{'95% CI':>18} {'p':>7} {'n_img':>6}"]
     for rung, r in out["rungs"].items():
-        line = (f"{rung:5} {len(r['seeds']):5d} {pm(r['metrics'].get(pk, {})):>15} "
+        line = (f"{rung:{w}} {len(r['seeds']):5d} {pm(r['metrics'].get(pk, {})):>15} "
                 f"{pm(r['metrics'].get(mk, {})):>15}")
         v = out["vs_baseline"].get(rung)
         if v:
@@ -728,9 +771,37 @@ def main(argv=None) -> int:
                      + ("PRIMARY" if v["role"] == "primary" else "(secondary)"))
         else:
             line += f" {'':8} {'':18} {'':7} {r['n_images']:6d}  (baseline)"
-        print(line)
-    for w in out["warnings"]:
-        print(f"WARNING: {w}")
+        lines.append(line)
+    if out["vs_baseline"]:
+        lines.append("robustness (secondary, no multiplicity correction; boot = two-level bootstrap, "
+                     "t = seed-paired t interval; each as: difference [95% CI] p)")
+    for rung, v in out["vs_baseline"].items():
+        lines += _robustness_lines(rung, baseline, v)
+    return lines + [f"WARNING: {w}" for w in out["warnings"]]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Aggregate per-seed run metrics per rung.")
+    ap.add_argument("--runs-dir", required=True)
+    ap.add_argument("--dataset", required=True)
+    ap.add_argument("--split", default="test")
+    ap.add_argument("--metric", default="iou")
+    ap.add_argument("--baseline", default="R0")
+    ap.add_argument("--allow-nonstandard", action="store_true",
+                    help="include runs scored with --limit / non-default tiling (smoke tests)")
+    ap.add_argument("--json-only", action="store_true",
+                    help="write the summary JSON and print only its path: no table "
+                         "(warnings go to stderr)")
+    a = ap.parse_args(argv)
+    out = aggregate_runs(a.runs_dir, a.dataset, a.split, a.metric, a.baseline,
+                         allow_nonstandard=a.allow_nonstandard)
+    path = Path(a.runs_dir) / f"{a.dataset}_{a.split}_summary.json"
+    path.write_text(json.dumps(out, indent=2))
+    if a.json_only:
+        for w in out["warnings"]:
+            print(f"WARNING: {w}", file=sys.stderr)
+    else:
+        print("\n".join(format_table(out)))
     print(f"wrote {path}")
     return 0
 
