@@ -53,6 +53,7 @@ import os
 import random
 import signal
 import socket
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -318,6 +319,9 @@ def _worker_init(worker_id: int) -> None:
     signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
 
+TIDY_SECONDS = 20.0          # how long stop_workers lets DataLoader's own shutdown tidy up
+
+
 def stop_workers(loader) -> None:
     """End the DataLoader's worker processes for certain. Call on EVERY way out of main.
 
@@ -349,11 +353,27 @@ def stop_workers(loader) -> None:
             w.join(timeout=10)
         except Exception:
             pass
+    # The iterator's own shutdown (queues, the pin-memory thread on CUDA) is now only tidying
+    # up, and it joins a thread without a timeout -- so it runs on a daemon thread with a
+    # deadline. `_shutdown` is set either way: its destructor must not start over and block
+    # the return from main.
+    tidy = threading.Thread(target=_quietly, args=(getattr(it, "_shutdown_workers", None),),
+                            daemon=True)
+    tidy.start()
+    tidy.join(timeout=TIDY_SECONDS)
     try:
-        it._shutdown_workers()          # queues and the pin-memory thread; the workers are gone
+        it._shutdown = True
     except Exception:
         pass
     loader._iterator = None
+
+
+def _quietly(fn) -> None:
+    try:
+        if fn is not None:
+            fn()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- durable writes

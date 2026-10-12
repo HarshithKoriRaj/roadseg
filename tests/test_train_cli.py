@@ -2206,6 +2206,49 @@ def test_a_job_wide_sigterm_with_live_workers_exits_75_and_leaves_no_process(tmp
     assert read(tmp_path / "runs" / "massachusetts_R1_s0" / "metrics.json")["resumes"] == 1
 
 
+def test_stop_workers_kills_first_and_never_waits_on_a_stuck_dataloader_shutdown(monkeypatch):
+    """G1. Killing is the part that matters. DataLoader's own shutdown joins its pin-memory
+    thread (CUDA only) without a timeout; if that ever blocks, main must still return."""
+    import threading
+    killed, gate = [], threading.Event()
+
+    class Worker:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def kill(self):
+            killed.append(self)
+            self.alive = False
+
+        def join(self, timeout=None):
+            pass
+
+    class Iterator:
+        _worker_pids_set, _shutdown = False, False
+
+        def __init__(self):
+            self._workers = [Worker(), Worker()]
+
+        def _shutdown_workers(self):
+            gate.wait(120)                         # stuck, as in a thread join that never ends
+
+    class Loader:
+        pass
+
+    loader = Loader()
+    loader._iterator = it = Iterator()
+    monkeypatch.setattr(tr, "TIDY_SECONDS", 0.3)
+    t0 = time.time()
+    tr.stop_workers(loader)
+    assert time.time() - t0 < 5 and len(killed) == 2
+    assert it._shutdown is True and loader._iterator is None      # its destructor is disarmed
+    gate.set()
+    tr.stop_workers(loader)                                        # nothing left: a no-op
+    tr.stop_workers(None)
+
+
 RUN_CLI = '''import sys, time, multiprocessing, signal
 from roadseg import runtime as rt
 
@@ -2495,7 +2538,7 @@ def test_the_canary_script_rehearsed_on_cpu(tmp_path):
                        text=True, env=env, timeout=3000)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out[-6000:]
-    assert out.rstrip().splitlines()[-1].startswith("CANARY: ALL PASSED"), out[-2000:]
+    assert r.stdout.rstrip().splitlines()[-1].startswith("CANARY: ALL PASSED"), out[-2000:]
     table = out[out.index("preflight table"):].splitlines()[1:4]
     assert table[0].split() == ["name", "steps/s", "peak", "GB"]
     assert [row.split()[0] for row in table[1:]] == ["R3", "unet"]
