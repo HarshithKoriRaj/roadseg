@@ -750,6 +750,74 @@ def test_metrics_are_frozen_before_test_scoring_and_never_rewritten(tiny):
     assert (run / "metrics.json").read_bytes() == frozen and (run / "best.pt").read_bytes() == best
 
 
+def test_eval_saves_probability_maps_and_scores_iou_at_05_in_the_same_pass(tiny, monkeypatch):
+    """W2. The test split is scored once: the pass keeps each stitched probability map as an
+    8-bit PNG and also scores the fixed threshold 0.5 -- from the SAME map, one forward pass."""
+    assert tiny.train() == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+    thr = read(run / "metrics.json")["threshold"]
+    small = ["--tile", "32", "--stride", "16", "--workers", "0"]
+    maps, real_predict = [], ev.predict_full
+
+    def predict(model, img, **k):
+        maps.append(real_predict(model, img, **k))
+        return maps[-1]
+
+    monkeypatch.setattr(ev, "predict_full", predict)
+    assert ev.main(["--run", str(run), "--split", "val", *small, "--save-probs"]) == 0
+    v = read(run / "val_metrics.json")
+    assert v["eval"]["saved_probs"] is True and v["eval"]["probs_dir"] == str(run / "val_probs")
+    assert len(maps) == len(v["per_image"]) == 2                    # one pass, not two
+    assert sorted(p.name for p in (run / "val_probs").iterdir()) == sorted(
+        f"{r['id']}.png" for r in v["per_image"])                   # and no temp file left
+    for row, prob in zip(v["per_image"], maps):
+        png = np.asarray(Image.open(run / "val_probs" / f"{row['id']}.png"))
+        assert png.dtype == np.uint8 and png.shape == prob.shape == (64, 64)
+        assert np.array_equal(png, np.rint(prob * 255).astype(np.uint8))
+        scored, from_png = prob >= np.float32(thr), png / 255.0 >= thr
+        off_ties = np.abs(prob - thr) > 0.5 / 255 + 1e-6            # half a grey level
+        assert np.array_equal(scored[off_ties], from_png[off_ties])
+
+    # the 0.5 fields are evaluate(threshold=0.5), without having run it
+    model = Tiny()
+    load_checkpoint(run / "best.pt", model)
+    val = dsmod.RoadFullDataset(tiny.data_root, "massachusetts", "val")
+    agg05, rows05 = ev.evaluate(model, val, 0.5, "cpu", tile=32, stride=16, full_metrics=False,
+                                use_amp=False)
+    for row, ref in zip(v["per_image"], rows05):
+        assert (row["iou_at_0.5"], row["tp_0.5"], row["fp_0.5"], row["fn_0.5"]) == (
+            ref["iou"], ref["tp"], ref["fp"], ref["fn"])
+    assert v["aggregate"]["dataset_iou_at_0.5"] == agg05["dataset_iou"]
+    assert v["aggregate"]["mean_iou_at_0.5"] == agg05["mean_iou"]
+    assert "mean_tp_0.5" not in v["aggregate"]                     # counts are not averaged
+
+    # the test split, with a stub whose probabilities are well separated: thresholding the
+    # PNGs reproduces the scored prediction on >= 99.99 % of all pixels
+    class Sharp(Tiny):
+        def forward(self, x):
+            return 1000.0 * super().forward(x)
+
+    monkeypatch.setattr(ev, "build_model", lambda cfg: Sharp())
+    maps.clear()
+    assert ev.main(["--run", str(run), "--split", "test", *small, "--save-probs"]) == 0
+    t = read(run / "test_metrics.json")
+    assert t["eval"]["saved_probs"] is True and len(maps) == 3
+    same = total = 0
+    for row, prob in zip(t["per_image"], maps):
+        png = np.asarray(Image.open(run / "test_probs" / f"{row['id']}.png"))
+        same += int(((png / 255.0 >= thr) == (prob >= np.float32(thr))).sum())
+        total += png.size
+        assert "iou_at_0.5" in row
+    assert total == 3 * 64 * 64 and same / total >= 0.9999
+
+    (run / "val_metrics.json").unlink()                             # without the flag: no maps
+    shutil.rmtree(run / "val_probs")
+    assert ev.main(["--run", str(run), "--split", "val", *small]) == 0
+    v = read(run / "val_metrics.json")
+    assert v["eval"]["saved_probs"] is False and v["eval"]["probs_dir"] is None
+    assert not (run / "val_probs").exists() and "dataset_iou_at_0.5" in v["aggregate"]
+
+
 def test_eval_refuses_a_checkpoint_that_is_not_the_validation_selected_one(tiny):
     """H6. Threshold and model selection were frozen on best_epoch; a best.pt from any other
     epoch (a copied file, a half-repaired directory) must not be scored on the test split."""
@@ -1218,7 +1286,8 @@ def test_wrapper_runs_train_then_scores_the_test_split(tmp_path):
     assert log == [                                    # G3: both steps name the GPU explicitly
         f"train argv -m roadseg.train --config {PROJECT}/configs/massachusetts.yaml --rung R1 "
         f"--seed 1 --resume auto --runs-dir {tmp_path / 'runs'} --device cuda",
-        f"eval argv -m roadseg.eval --run {run} --split test --workers 8 --device cuda"]
+        f"eval argv -m roadseg.eval --run {run} --split test --workers 8 --device cuda "
+        f"--save-probs"]                               # W2: the one test pass keeps its maps
     assert "task 4 -> dataset=massachusetts name=R1 seed=1" in out
     assert "WARNING: the LIVE tree, not a snapshot" in out          # no ROADSEG_CODE: say so
     rc, log, out = _wrapper(tmp_path, {}, task=33)                 # a baseline uses --model

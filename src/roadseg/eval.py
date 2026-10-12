@@ -5,6 +5,11 @@ scored. Scoring on tiles would change the metric: overlapping borders get
 double-counted and nodata handling differs at tile edges.
 
 CLI: python -m roadseg.eval --run <run_dir> --split {val,test} [--force] [--no-apls]
+                            [--save-probs] [--device cuda]
+
+Every pass also reports the IoU at the fixed threshold 0.5 (`iou_at_0.5` per image,
+`dataset_iou_at_0.5` / `mean_iou_at_0.5`), and with --save-probs keeps the stitched
+probability maps as 8-bit PNGs in <run_dir>/<split>_probs/.
 """
 from __future__ import annotations
 
@@ -22,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from .data.dataset import RoadFullDataset
 from .data.tiling import stitch, tile_image
@@ -90,8 +96,9 @@ def predict_full(model, img: np.ndarray, tile: int = 512, stride: int = 256,
 
 
 def _score_images(model, dataset, threshold, device, tile, stride, batch, full_metrics,
-                  with_apls, workers, use_amp=None):
-    """Yield (item_id, row) in dataset order. Predictions run here; CPU metrics may be pooled."""
+                  with_apls, workers, use_amp=None, on_prob=None):
+    """Yield (item_id, row, extra) in dataset order. Predictions run here; CPU metrics may be
+    pooled. `extra` is what `on_prob(item, prob)` returned for the image's probability map."""
     thr = np.float32(threshold)
     n = len(dataset)
     if not (full_metrics and workers > 0):
@@ -99,8 +106,9 @@ def _score_images(model, dataset, threshold, device, tile, stride, batch, full_m
             item = dataset[i]
             prob = predict_full(model, item["image"], tile=tile, stride=stride,
                                 device=device, batch=batch, use_amp=use_amp)
+            extra = on_prob(item, prob) if on_prob is not None else None
             yield item["id"], image_metrics(prob >= thr, item["mask"], item["valid"],
-                                            full_metrics, with_apls)
+                                            full_metrics, with_apls), extra
         return
     pending: deque = deque()
     ctx = mp.get_context("spawn")            # never fork a process that has initialised CUDA
@@ -109,22 +117,23 @@ def _score_images(model, dataset, threshold, device, tile, stride, batch, full_m
             item = dataset[i]
             prob = predict_full(model, item["image"], tile=tile, stride=stride,
                                 device=device, batch=batch, use_amp=use_amp)
+            extra = on_prob(item, prob) if on_prob is not None else None
             fut = pool.submit(image_metrics, prob >= thr, item["mask"], item["valid"],
                               True, with_apls)
-            pending.append((item["id"], fut))
+            pending.append((item["id"], fut, extra))
             while len(pending) >= 4 * workers:           # bound queued 3 MB arrays
-                iid, f = pending.popleft()
-                yield iid, f.result()
+                iid, f, extra = pending.popleft()
+                yield iid, f.result(), extra
         while pending:
-            iid, f = pending.popleft()
-            yield iid, f.result()
+            iid, f, extra = pending.popleft()
+            yield iid, f.result(), extra
 
 
 @torch.no_grad()
 def evaluate(model, dataset, threshold: float = 0.5, device: str = "cuda", *,
              tile: int = 512, stride: int = 256, full_metrics: bool = True,
              with_apls: bool = False, batch: int = 8, workers: int = 0,
-             use_amp: bool | None = None) -> tuple[dict, list[dict]]:
+             use_amp: bool | None = None, on_prob=None) -> tuple[dict, list[dict]]:
     """Score `dataset` at `threshold`. Returns (aggregate, per-image rows).
 
     full_metrics=False (per-epoch checkpoint selection) computes only the pixel
@@ -132,17 +141,23 @@ def evaluate(model, dataset, threshold: float = 0.5, device: str = "cuda", *,
     from every `mean_*` (never counted as a perfect 1.0). `workers>0` computes the
     per-image CPU metrics (relaxed-F1, clDice, APLS) in a spawn process pool;
     predictions stay sequential in this process. Rows are in dataset order.
+
+    `on_prob(item, prob)` is called once per image with its stitched probability map --
+    the one forward pass there is -- and may return a dict of further per-image fields;
+    they are merged into the image's row and take no part in the aggregate.
     """
     was_training = model.training
     pooled = dict.fromkeys(_COUNTS, 0)
-    rows = []
+    rows, extras = [], []
     try:
-        for iid, r in _score_images(model, dataset, threshold, device, tile, stride, batch,
-                                    full_metrics, with_apls, workers, use_amp):
+        for iid, r, extra in _score_images(model, dataset, threshold, device, tile, stride,
+                                           batch, full_metrics, with_apls, workers, use_amp,
+                                           on_prob):
             for k in ("tp", "fp", "fn"):
                 pooled[k] += r[k]
             pooled["tn"] += r["n_valid"] - r["tp"] - r["fp"] - r["fn"]
             rows.append({"id": iid, **r})
+            extras.append(extra or {})
     finally:
         model.train(was_training)
     if not rows:
@@ -155,7 +170,42 @@ def evaluate(model, dataset, threshold: float = 0.5, device: str = "cuda", *,
         out.update({f"mean_{k}": float(np.nanmean([r[k] for r in rows])) for k in keys})
     out["n_images"] = len(rows)
     out["n_scored"] = sum(r["n_valid"] > 0 for r in rows)
-    return out, rows
+    return out, [{**r, **e} for r, e in zip(rows, extras)]
+
+
+FIXED_THRESHOLD = 0.5        # reported beside the validation-selected threshold, never instead
+
+
+def fixed_threshold_row(prob: np.ndarray, mask: np.ndarray, valid: np.ndarray) -> dict:
+    """IoU of one image at the fixed threshold 0.5, from the probability map already
+    computed: the model's quality independent of the validation-selected threshold."""
+    c = confusion(prob >= np.float32(FIXED_THRESHOLD), mask, valid)
+    return {"iou_at_0.5": metrics_from_confusion(c)["iou"],
+            "tp_0.5": c["tp"], "fp_0.5": c["fp"], "fn_0.5": c["fn"]}
+
+
+def fixed_threshold_aggregate(rows: list[dict]) -> dict:
+    """dataset_iou_at_0.5 (pooled counts) and mean_iou_at_0.5 (NaN rows excluded)."""
+    pooled = {k: sum(r[f"{k}_0.5"] for r in rows) for k in ("tp", "fp", "fn")}
+    pooled["tn"] = sum(r["n_valid"] for r in rows) - sum(pooled.values())
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)         # all-NaN slice
+        mean = float(np.nanmean([r["iou_at_0.5"] for r in rows]))
+    return {"dataset_iou_at_0.5": metrics_from_confusion(pooled)["iou"],
+            "mean_iou_at_0.5": mean}
+
+
+def save_prob_png(path: Path, prob: np.ndarray) -> None:
+    """The stitched probability map as an 8-bit PNG, round(p * 255): atomic (temp file,
+    fsync, rename). Thresholding the file at t reproduces `prob >= t` except where p lies
+    within half a grey level (1/510) of t."""
+    tmp = tmp_name(path)
+    image = Image.fromarray(np.rint(np.clip(prob, 0.0, 1.0) * 255.0).astype(np.uint8))
+    with open(tmp, "wb") as f:
+        image.save(f, format="PNG")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 @torch.no_grad()
@@ -228,6 +278,9 @@ def main(argv=None) -> int:
     ap.add_argument("--stride", type=int, default=256)
     ap.add_argument("--limit", type=int, default=None, help="first N images only (smoke use)")
     ap.add_argument("--workers", type=int, default=8, help="CPU metric processes (0 = in-process)")
+    ap.add_argument("--save-probs", action="store_true",
+                    help="also write every stitched probability map as an 8-bit PNG to "
+                         "<run>/<split>_probs/<id>.png")
     ap.add_argument("--device", default=None,
                     help="default: cuda if available, else cpu. An explicit cuda device never "
                          "falls back to the CPU (exit 3 if CUDA is unavailable)")
@@ -274,13 +327,32 @@ def _score(a, run: Path, device: str) -> int:
     if a.limit is not None:
         dataset = _Limited(dataset, a.limit)
 
+    # The split is scored once, so everything a later question could need comes out of this
+    # one pass over the probability maps: the maps themselves (--save-probs: threshold
+    # sensitivity, unmasked numbers, figures) and the IoU at the fixed threshold 0.5.
+    probs_dir = run / f"{a.split}_probs" if a.save_probs else None
+    if probs_dir is not None:
+        probs_dir.mkdir(exist_ok=True)
+        clear_stale_temps(probs_dir)               # the directory belongs to the locked run
+
+    def on_prob(item, prob):
+        if probs_dir is not None:
+            if os.sep in str(item["id"]):
+                raise ValueError(f"image id {item['id']!r} cannot be a file name")
+            save_prob_png(probs_dir / f"{item['id']}.png", prob)
+        return fixed_threshold_row(prob, item["mask"], item["valid"])
+
     agg, rows = evaluate(model, dataset, threshold, device, tile=a.tile, stride=a.stride,
                          full_metrics=True, with_apls=not a.no_apls, workers=a.workers,
-                         use_amp=cfg.get("amp"))     # same precision path that picked the threshold
+                         use_amp=cfg.get("amp"),     # same precision path that picked the threshold
+                         on_prob=on_prob)
+    agg.update(fixed_threshold_aggregate(rows))
     standard = a.limit is None and a.tile == 512 and a.stride == 256
     ev = {"tile": a.tile, "stride": a.stride, "with_apls": not a.no_apls, "forced": a.force,
           "limit": a.limit, "checkpoint_epoch": ck.get("epoch"),
           "checkpoint_best_val": ck.get("best"),
+          "saved_probs": probs_dir is not None,
+          "probs_dir": None if probs_dir is None else str(probs_dir),
           "timestamp": datetime.now(timezone.utc).isoformat()}
     # Which code scored, and which code trained (they are the same commit when both steps
     # ran from one frozen snapshot; if not, the result says so).
