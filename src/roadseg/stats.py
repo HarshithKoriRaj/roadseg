@@ -148,6 +148,104 @@ def two_level_bootstrap(R: np.ndarray, B: np.ndarray, n_boot: int = 10_000, seed
             "alpha": float(alpha)}
 
 
+def _pooled_ratio(tp: np.ndarray, union: np.ndarray, valid: np.ndarray | None) -> np.ndarray:
+    """tp / union elementwise, with the scorer's conventions for an empty union.
+
+    As `metrics._ratio` / `metrics_from_confusion` do for one image and for the dataset: 1.0
+    where the union tp+fp+fn is empty but valid pixels were scored (nothing to find, nothing
+    predicted), NaN where no valid pixel was scored at all. Without `valid` (rows that carry
+    no `n_valid`) an empty union is 1.0. Never a 0/0.
+    """
+    out = np.ones(np.shape(union), float)
+    np.divide(tp, union, out=out, where=union > 0)
+    if valid is not None:
+        out[valid <= 0] = np.nan
+    return out
+
+
+def _arm_counts(c: dict, arm: str) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    tp, fp, fn = (np.asarray(c[k], float) for k in ("tp", "fp", "fn"))
+    nv = None if c.get("n_valid") is None else np.asarray(c["n_valid"], float)
+    for a in (tp, fp, fn) + (() if nv is None else (nv,)):
+        if a.ndim != 2 or a.shape != tp.shape:
+            raise ValueError(f"{arm} counts must all be [n_seeds, n_images], got {a.shape} and {tp.shape}")
+        if not (np.isfinite(a).all() and (a >= 0).all()):
+            raise ValueError(f"{arm} counts must be finite and non-negative")
+    return tp, tp + fp + fn, nv
+
+
+def pooled_iou_bootstrap(rung: dict, base: dict, n_boot: int = 10_000, seed: int = 0,
+                         alpha: float = 0.05, chunk: int = 500) -> dict:
+    """Two-level bootstrap of the difference in POOLED IoU between two arms.
+
+    rung, base: {"tp", "fp", "fn"[, "n_valid"]}, each [n_seeds_of_that_arm, n_images] pixel
+    counts, same image order in both arms.
+
+    Estimand: mean_s P(rung, s) - mean_s P(base, s), where P(arm, s) = sum_i tp / sum_i
+    (tp + fp + fn) over the images, for the two TRAINING PROCEDURES and the image population.
+    This is the pixel-weighted counterpart of the per-image headline: a dense image counts in
+    proportion to its road pixels, where per-image IoU gives an image with ten road pixels
+    the weight of one with a hundred thousand. The two can disagree; neither is the other's
+    check.
+
+    Each replicate resamples seeds with replacement within each arm (independently) and
+    images with replacement (the same draw for both arms and every seed, so images stay
+    paired), then recomputes every resampled seed's ratio of sums from the resampled images'
+    counts and averages the ratios over the resampled seeds. It is a ratio of resampled
+    sums, not a resampled mean of per-image ratios. Percentile interval; two-sided Monte
+    Carlo p-value. Deterministic given `seed` (and `chunk`).
+
+    Empty union, in the data or in a replicate: see `_pooled_ratio` (1.0 on scored pixels,
+    NaN without any valid pixel). `n_boot_empty_union` counts the replicates in which some
+    arm-seed's resampled union was empty; `n_boot_nan` those dropped because an arm had no
+    valid pixel in any resampled seed. Images without valid pixels are kept: they add zero
+    to every sum.
+    """
+    tp_r, un_r, nv_r = _arm_counts(rung, "rung")
+    tp_b, un_b, nv_b = _arm_counts(base, "baseline")
+    (sr, N), sb = tp_r.shape, tp_b.shape[0]
+    if tp_b.shape[1] != N:
+        raise ValueError("rung and baseline must cover the same images")
+    if N < 2:
+        raise ValueError(f"need at least 2 images, got {N}")
+
+    def tot(a, w=None):                                   # sums over (resampled) images -> [..., S]
+        return None if a is None else a.sum(axis=1) if w is None else w @ a.T
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", RuntimeWarning)             # nanmean of an all-NaN row
+        pr = _pooled_ratio(tot(tp_r), tot(un_r), tot(nv_r))
+        pb = _pooled_ratio(tot(tp_b), tot(un_b), tot(nv_b))
+        point = float(np.nanmean(pr) - np.nanmean(pb))
+        if not np.isfinite(point):
+            raise ValueError("pooled IoU is undefined: an arm has no valid pixel in any image")
+        rng = np.random.default_rng(seed)
+        out = np.empty(n_boot)
+        n_empty = 0
+        for lo_i in range(0, n_boot, chunk):
+            c = min(chunk, n_boot - lo_i)
+            ri = rng.integers(0, sr, size=(c, sr))
+            bi = rng.integers(0, sb, size=(c, sb))
+            ii = rng.integers(0, N, size=(c, N))
+            # W[r, i] = how many times replicate r drew image i; the sums below are exact in
+            # float64 (integer counts far below 2**53), so `union > 0` is an exact test.
+            W = np.bincount((ii + N * np.arange(c)[:, None]).ravel(),
+                            minlength=c * N).reshape(c, N).astype(float)
+            ur, ub = tot(un_r, W), tot(un_b, W)                          # [c, sr], [c, sb]
+            qr = _pooled_ratio(tot(tp_r, W), ur, tot(nv_r, W))
+            qb = _pooled_ratio(tot(tp_b, W), ub, tot(nv_b, W))
+            n_empty += int(((ur == 0).any(axis=1) | (ub == 0).any(axis=1)).sum())
+            out[lo_i:lo_i + c] = (np.nanmean(np.take_along_axis(qr, ri, axis=1), axis=1)
+                                  - np.nanmean(np.take_along_axis(qb, bi, axis=1), axis=1))
+    lo, hi = np.nanquantile(out, [alpha / 2, 1 - alpha / 2])
+    return {"mean_diff": point, "ci_low": float(lo), "ci_high": float(hi), "p_value": _mc_p(out),
+            "rung": {"mean": float(np.nanmean(pr)), "per_seed": pr.tolist()},
+            "baseline": {"mean": float(np.nanmean(pb)), "per_seed": pb.tolist()},
+            "n_images": int(N), "n_seeds_rung": int(sr), "n_seeds_baseline": int(sb),
+            "n_boot": int(n_boot), "n_boot_empty_union": n_empty,
+            "n_boot_nan": int(np.isnan(out).sum()), "seed": int(seed), "alpha": float(alpha)}
+
+
 def seed_paired_t(d, seeds=None, alpha: float = 0.05) -> dict | None:
     """Student t interval for the mean of per-seed paired differences `d[s]`.
 
@@ -275,8 +373,33 @@ def _num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
+def _field(per_seed: list[dict], ids: list, key: str) -> np.ndarray | None:
+    """[n_seeds, len(ids)] array of one per-image field; None if any row lacks it or holds a
+    non-number (older result files do not carry every field)."""
+    out = np.empty((len(per_seed), len(ids)))
+    for s, rows in enumerate(per_seed):
+        for j, i in enumerate(ids):
+            v = rows[i].get(key)
+            if not _num(v):
+                return None
+            out[s, j] = v
+    return out
+
+
+def _counts(arms: list[list[dict]], ids: list, suffix: str = "") -> tuple[list[dict] | None, str | None]:
+    """Per arm, the {"tp", "fp", "fn", "n_valid"} arrays `pooled_iou_bootstrap` takes, read
+    from the fields tp<suffix> etc. -> (counts per arm, None), or (None, why not)."""
+    keys = [k + suffix for k in ("tp", "fp", "fn")]
+    got = [{k: _field(per_seed, ids, k) for k in keys} for per_seed in arms]
+    missing = [k for k in keys if any(g[k] is None for g in got)]
+    if missing:
+        return None, f"per-image field(s) {', '.join(missing)} absent from at least one run"
+    return [{"tp": g[keys[0]], "fp": g[keys[1]], "fn": g[keys[2]],
+             "n_valid": _field(per_seed, ids, "n_valid")} for g, per_seed in zip(got, arms)], None
+
+
 def _rung_images(name: str, seeds: list[int], rung_runs: dict, metric: str):
-    """-> (ids sorted, array [n_seeds, n_ids], n_gt dict or None)."""
+    """-> (ids sorted, array [n_seeds, n_ids], n_gt dict or None, per-seed {id: row})."""
     per_seed = []
     for s in seeds:
         rows = rung_runs[s]["per_image"]
@@ -294,7 +417,7 @@ def _rung_images(name: str, seeds: list[int], rung_runs: dict, metric: str):
     ids = sorted(ids0)
     arr = np.array([[float(d[i][metric]) for i in ids] for d in per_seed], float)
     n_gt = {i: per_seed[0][i]["n_gt"] for i in ids} if all("n_gt" in per_seed[0][i] for i in ids) else None
-    return ids, arr, n_gt
+    return ids, arr, n_gt, per_seed
 
 
 def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "iou",
@@ -312,6 +435,14 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
     seeds. Unlike `seed_level` it does not read each run's own `mean_<metric>`, which is
     over that run's full image set.
 
+    `pooled_iou` (secondary) is the difference in pooled IoU, sum tp / sum (tp+fp+fn) over the
+    common image ids averaged over seeds, with its own two-level bootstrap; see
+    `pooled_iou_bootstrap`. It is always about IoU, whatever `metric` is.
+
+    An analysis whose per-image fields are missing from some run (older result files) is
+    None, is named with its reason in `vs_baseline[rung]["skipped"]`, and gets one line in
+    `warnings`; it is never a crash and never a silent omission.
+
     `analysis_plan` is `ANALYSIS_PLAN` verbatim, whatever the arguments. `primary` says
     whether THIS call is the pre-specified primary analysis; if it is, the plan's rung has
     `vs_baseline[rung]["role"] == "primary"`. Every other comparison, and every comparison
@@ -326,6 +457,7 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
 
     rungs: dict[str, dict] = {}
     imgs: dict[str, tuple] = {}
+    rows: dict[str, list[dict]] = {}
     for rung in sorted(runs):
         seeds = sorted(runs[rung])
         keys = sorted({k for s in seeds for k, v in runs[rung][s]["aggregate"].items() if _num(v)})
@@ -334,7 +466,7 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
             vals = np.array([runs[rung][s]["aggregate"].get(k, np.nan) for s in seeds], float)
             metrics[k] = {"mean": float(np.mean(vals)),
                           "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else None}
-        ids, arr, n_gt = _rung_images(rung, seeds, runs[rung], metric)
+        ids, arr, n_gt, rows[rung] = _rung_images(rung, seeds, runs[rung], metric)
         imgs[rung] = (ids, arr)
         entry = {"seeds": seeds, "metrics": metrics, "n_images": len(ids),
                  "n_empty_gt": None if n_gt is None else int(sum(v == 0 for v in n_gt.values()))}
@@ -353,6 +485,7 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
                       np.nanmean(imgs[rung][1][i]))) for i, s in enumerate(sorted(runs[rung]))]
 
     vs: dict[str, dict] = {}
+    skips: dict[tuple[str, str], list[str]] = {}          # (analysis, why) -> rungs it was skipped for
     b_ids, b_arr = imgs[baseline]
     for rung in rungs:
         if rung == baseline:
@@ -379,12 +512,29 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
             se = float(np.sqrt(np.var(rs, ddof=1) / len(rs) + np.var(bs, ddof=1) / len(bs)))
         paired_t, notes = _paired_t_block(R, Bm, rungs[rung]["seeds"], base_seeds)
         warns.extend(f"{rung}: {n}" for n in notes)
+        skipped: dict[str, str] = {}
+        arms = [rows[rung], rows[baseline]]
+
+        def pooled(analysis: str, suffix: str = ""):
+            counts, why = _counts(arms, common, suffix)
+            if counts is None:
+                skipped[analysis] = why
+                return None
+            try:
+                return pooled_iou_bootstrap(*counts, n_boot=n_boot, seed=seed)
+            except ValueError as e:
+                raise ValueError(f"{rung} vs {baseline}, {analysis}: {e}") from e
+
         vs[rung] = {"n_images": len(common), "n_missing_ids": n_missing,
                     "n_dropped_nan": image_level["n_dropped"],
                     "image_level": image_level, "two_level": two_level,
                     "seed_level": {"rung": rs, "baseline": bs,
                                    "mean_diff": float(np.mean(rs) - np.mean(bs)), "se": se},
-                    "seed_paired_t": paired_t}
+                    "seed_paired_t": paired_t, "pooled_iou": pooled("pooled_iou"),
+                    "skipped": skipped}
+        for analysis, why in skipped.items():
+            skips.setdefault((analysis, why), []).append(rung)
+    warns.extend(f"{analysis} skipped for {', '.join(rr)}: {why}" for (analysis, why), rr in skips.items())
     plan = ANALYSIS_PLAN["primary"]
     deviations = _plan_deviations(metric=metric, split=split, baseline=baseline, n_boot=n_boot,
                                   seed=seed, allow_nonstandard=allow_nonstandard, compared=set(vs))

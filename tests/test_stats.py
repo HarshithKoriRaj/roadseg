@@ -459,3 +459,219 @@ def test_aggregate_seed_paired_t_drops_an_image_only_in_the_seed_where_it_is_nan
     _write_run(tmp_path, "R1", 1, [0.6, 0.6, 0.6, 0.9], 0.6, ids=ids)
     t = aggregate_runs(tmp_path, "massachusetts", n_boot=200)["vs_baseline"]["R1"]["seed_paired_t"]
     assert t["d"] == pytest.approx([0.1, (0.3 + 0.8) / 4])
+
+
+# ------------------------------------------------------ S3: the pooled-IoU difference
+
+def _row(iid, tp, fp, fn, n_valid=None, at05=None):
+    """A per-image row as the scorer writes it, from confusion counts. Same conventions as
+    roadseg.metrics: IoU 1.0 when tp+fp+fn == 0 on a scored image, NaN when no pixel is valid.
+    `at05` = (tp, fp, fn) at the fixed 0.5 threshold; None = an older file without those fields."""
+    n_valid = tp + fp + fn + 1000 if n_valid is None else n_valid
+
+    def iou(t, p, n):
+        return float("nan") if n_valid == 0 else 1.0 if t + p + n == 0 else t / (t + p + n)
+
+    row = {"id": iid, "iou": iou(tp, fp, fn), "tp": tp, "fp": fp, "fn": fn,
+           "n_gt": tp + fn, "n_pred": tp + fp, "n_valid": n_valid}
+    if at05 is not None:
+        t, p, n = at05
+        row.update({"iou_at_0.5": iou(t, p, n), "tp_0.5": t, "fp_0.5": p, "fn_0.5": n})
+    return row
+
+
+def _img(iid, union, iou, at05=False):
+    """An image whose ground truth has `union` road pixels, of which the model finds `iou`."""
+    tp = round(union * iou)
+    return _row(iid, tp, 0, union - tp, at05=(tp, 0, union - tp) if at05 else None)
+
+
+def _write_rows(root, rung, seed, rows, dataset="massachusetts", split="test", drop=()):
+    d = root / f"{dataset}_{rung}_s{seed}"
+    d.mkdir(parents=True)
+    rows = [{k: v for k, v in r.items() if k not in drop} for r in rows]
+    tp = sum(r.get("tp", 0) for r in rows)
+    union = sum(r.get("tp", 0) + r.get("fp", 0) + r.get("fn", 0) for r in rows)
+    (d / f"{split}_metrics.json").write_text(json.dumps(
+        {"cfg": {"dataset": dataset, "rung": rung, "seed": seed}, "split": split,
+         "protocol": "standard",
+         "aggregate": {"dataset_iou": tp / union if union else 1.0,
+                       "mean_iou": float(np.nanmean([r["iou"] for r in rows]))},
+         "per_image": rows}))
+
+
+def _arm(tp, union, n_valid=None):
+    """Counts for pooled_iou_bootstrap from [n_seeds][n_images] tp and union (fp = 0)."""
+    tp, union = np.array(tp, float), np.array(union, float)
+    c = {"tp": tp, "fp": np.zeros_like(tp), "fn": union - tp}
+    if n_valid is not None:
+        c["n_valid"] = np.array(n_valid, float)
+    return c
+
+
+def test_pooled_iou_point_estimate_is_the_seed_mean_of_ratio_of_sums():
+    rung = _arm([[90, 1], [80, 5]], [[100, 10], [100, 10]])       # 91/110 and 85/110
+    base = _arm([[50, 5]], [[100, 10]])                           # 55/110
+    r = stats.pooled_iou_bootstrap(rung, base, n_boot=300, seed=4)
+    assert r["rung"]["per_seed"] == pytest.approx([91 / 110, 85 / 110])
+    assert r["rung"]["mean"] == pytest.approx(0.8) and r["baseline"]["mean"] == pytest.approx(0.5)
+    assert r["mean_diff"] == pytest.approx(0.3)
+    assert (r["n_images"], r["n_seeds_rung"], r["n_seeds_baseline"]) == (2, 2, 1)
+    assert (r["n_boot"], r["seed"], r["alpha"]) == (300, 4, 0.05)
+    assert r == stats.pooled_iou_bootstrap(rung, base, n_boot=300, seed=4)       # deterministic
+    assert r != stats.pooled_iou_bootstrap(rung, base, n_boot=300, seed=5)
+
+
+def test_pooled_iou_bootstrap_resamples_seeds_within_arm():
+    """Identical images, so only the seed draw moves a replicate: the rung's three pooled IoUs
+    are 0.4/0.6/0.8 and a replicate is the mean of three of them drawn with replacement.
+    P(all three are the lowest) = 1/27 = 3.7% > 2.5%, so the 95% interval is exactly the range."""
+    n = 12
+    rung = _arm([[4] * n, [6] * n, [8] * n], [[10] * n] * 3)
+    base = _arm([[5] * n], [[10] * n])
+    r = stats.pooled_iou_bootstrap(rung, base, n_boot=4000)
+    assert r["mean_diff"] == pytest.approx(0.1)
+    assert (r["ci_low"], r["ci_high"]) == pytest.approx((-0.1, 0.3))
+
+
+def test_pooled_iou_bootstrap_resamples_images_paired_across_arms():
+    """One seed per arm and identical arms: with the same images drawn for both, every replicate
+    difference is exactly 0 however much the images differ from one another."""
+    rng = np.random.default_rng(3)
+    union = rng.integers(1, 5000, size=(1, 40))
+    tp = (union * rng.random((1, 40))).astype(int)
+    r = stats.pooled_iou_bootstrap(_arm(tp, union), _arm(tp, union), n_boot=500)
+    assert r["mean_diff"] == r["ci_low"] == r["ci_high"] == 0.0 and r["p_value"] == 1.0
+
+
+def test_pooled_iou_bootstrap_matches_a_naive_reference():
+    """Against the textbook loop (own RNG stream, so agreement is statistical, not bitwise)."""
+    rng = np.random.default_rng(11)
+    S, N, B = 3, 30, 4000
+    union = rng.integers(50, 4000, size=N)
+    tp_r = (union * np.clip(0.55 + 0.1 * rng.standard_normal((S, N)) + [[0.05], [0.0], [-0.05]], 0, 1)).astype(int)
+    tp_b = (union * np.clip(0.50 + 0.1 * rng.standard_normal((S, N)), 0, 1)).astype(int)
+    un = np.tile(union, (S, 1))
+    got = stats.pooled_iou_bootstrap(_arm(tp_r, un), _arm(tp_b, un), n_boot=B)
+    ref_rng, ref = np.random.default_rng(99), np.empty(B)
+    for b in range(B):
+        ii = ref_rng.integers(0, N, N)
+        rs, bs = ref_rng.integers(0, S, S), ref_rng.integers(0, S, S)
+        ref[b] = (np.mean([tp_r[s, ii].sum() / union[ii].sum() for s in rs])
+                  - np.mean([tp_b[s, ii].sum() / union[ii].sum() for s in bs]))
+    lo, hi = np.quantile(ref, [0.025, 0.975])
+    assert got["ci_high"] - got["ci_low"] == pytest.approx(hi - lo, rel=0.06)
+    assert got["ci_low"] == pytest.approx(lo, abs=0.06 * (hi - lo))
+    assert got["ci_high"] == pytest.approx(hi, abs=0.06 * (hi - lo))
+
+
+def test_pooled_iou_empty_union_is_one_as_in_the_per_image_metric():
+    """No road and none predicted on scored pixels is IoU 1.0 (metrics._ratio), also when it
+    only happens inside a replicate; it is counted, never a silent 0/0."""
+    rung = _arm([[0, 0, 0]], [[0, 0, 0]])                     # predicts nothing, nothing to find
+    base = {"tp": np.zeros((1, 3)), "fp": np.array([[5.0, 0.0, 0.0]]), "fn": np.zeros((1, 3))}
+    r = stats.pooled_iou_bootstrap(rung, base, n_boot=2000)
+    assert r["rung"]["mean"] == 1.0 and r["baseline"]["mean"] == 0.0 and r["mean_diff"] == 1.0
+    # the false positives sit on one image of three: (2/3)^3 = 30% of replicates miss it -> 1 - 1
+    assert r["ci_low"] == 0.0 and r["ci_high"] == 1.0
+    assert r["n_boot_empty_union"] == 2000 and r["n_boot_nan"] == 0
+    assert np.isfinite([r["ci_low"], r["ci_high"], r["p_value"]]).all()
+
+
+def test_pooled_iou_without_valid_pixels_is_nan_not_one():
+    """An image with no valid pixel is NaN for the scorer, not a perfect score: a replicate
+    that drew only such images is dropped and counted."""
+    rung = _arm([[8, 0]], [[10, 0]], n_valid=[[100, 0]])
+    base = _arm([[5, 0]], [[10, 0]], n_valid=[[100, 0]])
+    r = stats.pooled_iou_bootstrap(rung, base, n_boot=2000)
+    assert r["mean_diff"] == pytest.approx(0.3)
+    assert 300 < r["n_boot_nan"] < 700                         # (1/2)^2 = 25% draw the dead image twice
+    assert r["ci_low"] == pytest.approx(0.3) and r["ci_high"] == pytest.approx(0.3)
+    dead = _arm([[0, 0]], [[0, 0]], n_valid=[[0, 0]])
+    with pytest.raises(ValueError, match="no valid pixel"):
+        stats.pooled_iou_bootstrap(dead, base, n_boot=50)
+
+
+def test_pooled_iou_rejects_bad_counts():
+    good = _arm([[5, 5]], [[10, 10]])
+    with pytest.raises(ValueError, match="rung.*non-negative"):
+        stats.pooled_iou_bootstrap({**good, "fp": np.array([[-1.0, 0.0]])}, good, n_boot=50)
+    with pytest.raises(ValueError, match="baseline.*non-negative"):
+        stats.pooled_iou_bootstrap(good, {**good, "tp": np.array([[np.nan, 0.0]])}, n_boot=50)
+    with pytest.raises(ValueError, match="same images"):
+        stats.pooled_iou_bootstrap(good, _arm([[5, 5, 5]], [[10, 10, 10]]), n_boot=50)
+    with pytest.raises(ValueError, match="at least 2"):
+        stats.pooled_iou_bootstrap(_arm([[5]], [[10]]), _arm([[5]], [[10]]), n_boot=50)
+
+
+def _huge_and_small(root, n_small=19):
+    """R0 scores 0.5 everywhere. `big` is better only on the one 1 000 000-pixel image,
+    `small` only on the nineteen 100-pixel ones."""
+    for s in (0, 1, 2):
+        def rows(huge, small):
+            return [_img("huge", 1_000_000, huge)] + [_img(f"s{i:02d}", 100, small) for i in range(n_small)]
+        _write_rows(root, "R0", s, rows(0.5, 0.5))
+        _write_rows(root, "big", s, rows(0.9, 0.5))
+        _write_rows(root, "small", s, rows(0.5, 0.9))
+
+
+def test_pooled_and_per_image_iou_answer_different_questions(tmp_path):
+    _huge_and_small(tmp_path)
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=2000)
+    big, small = out["vs_baseline"]["big"], out["vs_baseline"]["small"]
+    # better on the huge image only: pooled IoU moves by ~0.4, per-image IoU by 0.4/20
+    assert big["pooled_iou"]["mean_diff"] == pytest.approx(0.4 * 1_000_000 / 1_001_900)
+    assert big["two_level"]["mean_diff"] == pytest.approx(0.02)
+    # ... and the pooled interval admits it hangs on one image: (19/20)^20 = 36% of replicates miss it
+    assert big["pooled_iou"]["ci_low"] == pytest.approx(0.0) and big["pooled_iou"]["ci_high"] > 0.39
+    # better on the nineteen small images only: the reverse
+    assert small["pooled_iou"]["mean_diff"] == pytest.approx(0.4 * 1900 / 1_001_900)     # 0.00076
+    assert small["two_level"]["mean_diff"] == pytest.approx(0.38)
+    assert small["pooled_iou"]["mean_diff"] < 0.001 < 0.3 < small["two_level"]["ci_low"]
+    assert out["rungs"]["big"]["metrics"]["dataset_iou"]["mean"] - out["rungs"]["R0"]["metrics"][
+        "dataset_iou"]["mean"] == pytest.approx(big["pooled_iou"]["mean_diff"])
+    assert "pooled_iou" not in big["skipped"] and not any("pooled_iou" in w for w in out["warnings"])
+    assert aggregate_runs(tmp_path, "massachusetts", n_boot=2000) == out
+
+
+def test_pooled_iou_is_over_the_images_common_to_both_arms(tmp_path):
+    for s in (0, 1):
+        _write_rows(tmp_path, "R0", s, [_img("a", 100, 0.5), _img("b", 300, 0.5), _img("only_r0", 10**6, 1.0)])
+        _write_rows(tmp_path, "R1", s, [_img("a", 100, 0.9), _img("b", 300, 0.5), _img("only_r1", 10**6, 0.0)])
+    p = aggregate_runs(tmp_path, "massachusetts", n_boot=200)["vs_baseline"]["R1"]["pooled_iou"]
+    assert p["n_images"] == 2 and p["mean_diff"] == pytest.approx(40 / 400)
+    assert p["rung"]["per_seed"] == pytest.approx([240 / 400] * 2)
+
+
+def test_pooled_iou_is_skipped_with_one_warning_when_counts_are_missing(runs):
+    """Older result files (rows without tp/fp/fn): no crash, no silent omission."""
+    out = aggregate_runs(runs, "massachusetts", n_boot=200)
+    for rung in ("R1", "R2"):
+        v = out["vs_baseline"][rung]
+        assert v["pooled_iou"] is None and "tp, fp, fn" in v["skipped"]["pooled_iou"]
+    w = [w for w in out["warnings"] if "pooled_iou" in w]
+    assert len(w) == 1 and "R1, R2" in w[0] and "tp, fp, fn" in w[0]
+    assert "warning" not in out["rungs"]["R2"]                 # a skip is not a per-rung data problem
+
+
+def test_pooled_iou_is_skipped_for_the_rung_whose_runs_lack_one_count(tmp_path):
+    for s in (0, 1):
+        rows = [_img("a", 100, 0.5), _img("b", 300, 0.6), _img("c", 200, 0.7)]
+        _write_rows(tmp_path, "R0", s, rows)
+        _write_rows(tmp_path, "R1", s, rows)
+        _write_rows(tmp_path, "R2", s, rows, drop=("fp",) if s else ())      # one seed, one field
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    assert out["vs_baseline"]["R1"]["pooled_iou"]["mean_diff"] == 0.0
+    assert out["vs_baseline"]["R2"]["pooled_iou"] is None
+    assert [w for w in out["warnings"] if "pooled_iou skipped for R2:" in w and "fp" in w]
+
+
+def test_pooled_iou_bootstrap_speed_at_the_real_size():
+    import time
+    rng = np.random.default_rng(0)
+    union = rng.integers(0, 60_000, size=(3, 935))
+    t = time.time()
+    r = stats.pooled_iou_bootstrap(_arm((union * rng.random((3, 935))).astype(int), union),
+                                   _arm((union * rng.random((3, 935))).astype(int), union))
+    dt = time.time() - t
+    assert r["n_boot"] == 10_000 and r["n_images"] == 935 and dt < 20, dt
