@@ -123,6 +123,18 @@ else
 fi
 nvidia-smi -L || true
 
+# ---- restart cap -------------------------------------------------------------------------
+# Every requeue (ours at the time limit, SLURM's after a preemption) counts. A task that has
+# been restarted this often is not making progress -- e.g. a step that can never finish inside
+# the time limit -- and would otherwise take a GPU-day per attempt, for ever.
+MAX_RESTARTS=20
+if (( ${SLURM_RESTART_COUNT:-0} > MAX_RESTARTS )); then
+    echo "task $SLURM_ARRAY_TASK_ID ($RUN) has been restarted ${SLURM_RESTART_COUNT} times" \
+         "(limit $MAX_RESTARTS): NOT running it again and NOT requeueing. Read the earlier" \
+         "attempts in this log, fix the cause, then resubmit this index by hand." >&2
+    exit 1
+fi
+
 # ---- signal forwarding -------------------------------------------------------------------
 # bash runs a trap only between commands, so a foreground python would hide the signal until
 # it exited. Each step therefore runs in the background and the shell sits in `wait`, which a

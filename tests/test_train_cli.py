@@ -1853,6 +1853,17 @@ def test_wrapper_term_after_usr1_still_does_not_requeue(tmp_path):
     assert log[-1] == "train got SIGTERM", out
 
 
+def test_wrapper_stops_after_20_restarts_without_requeueing(tmp_path):
+    """H2. Something that can never finish inside the time limit (a scoring that needs 25 h)
+    would otherwise requeue for ever, a GPU-day each time."""
+    rc, log, out = _wrapper(tmp_path, {}, env_extra={"SLURM_RESTART_COUNT": "20"})
+    assert rc == 0 and len(log) == 2 and "restart 20" in out, out          # 20 is still allowed
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True}},
+                            env_extra={"SLURM_RESTART_COUNT": "21"})
+    assert rc != 0 and log == [], out                    # python never started, nothing requeued
+    assert "restarted 21 times" in out and "limit 20" in out and "NOT requeueing" in out
+
+
 def test_wrapper_requeues_when_python_dies_of_the_signal_before_its_handlers_exist(tmp_path):
     rc, log, out = _wrapper(tmp_path, {"train": {"block": True, "handle": False}},
                             signal_step="train")
