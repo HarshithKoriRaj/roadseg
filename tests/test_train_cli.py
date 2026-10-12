@@ -1102,6 +1102,13 @@ if "env" in s:
 if "touch" in s:
     run = sys.argv[sys.argv.index("--run") + 1]
     open(os.path.join(run, s["touch"]), "w").write("{{}}")
+if s.get("spawn"):                      # a DataLoader worker: ignores SIGTERM, outlives nothing
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(120)
+        os._exit(0)
+    open(log + "." + mod + ".worker", "w").write(str(pid))
 if s.get("block"):                      # a long step that honours SIGTERM the way train.py does
     got = []
     if s.get("handle", True):
@@ -1852,6 +1859,54 @@ def test_wrapper_term_after_usr1_still_does_not_requeue(tmp_path):
                             signal_step="train", signum=(signal.SIGUSR1, signal.SIGTERM))
     assert _requeues(log) == [] and rc != 0 and "not requeueing" in out, out
     assert log[-1] == "train got SIGTERM", out
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return Path(f"/proc/{pid}/stat").read_text().split(") ")[-1][0] != "Z"     # not a zombie
+
+
+@pytest.mark.parametrize("step", ["train", "eval"])
+def test_wrapper_watchdog_kills_a_step_that_does_not_stop_after_usr1_and_requeues(tmp_path, step):
+    """H5. USR1 leaves 180 s. A python that is still running 120 s later (the finish phase's
+    validation scoring cannot be interrupted) would end the job TIMEOUT, un-requeued. The
+    watchdog SIGKILLs the step's whole process group -- on-disk state is kill-safe -- and
+    requeues."""
+    spec = {step: {"block": True, "linger": 100, "spawn": True}}          # deaf to the signal
+    t0 = time.time()
+    rc, log, out = _wrapper(tmp_path, spec, signal_step=step,
+                            env_extra={"ROADSEG_USR1_WATCHDOG": "1"})
+    assert rc == 0 and time.time() - t0 < 30, out
+    assert _requeues(log) == ["scontrol requeue 777_4"] and log[-1].startswith("scontrol"), out
+    assert f"{step} got SIGTERM" in log                            # it WAS told, and went on
+    assert "watchdog:" in out and f"{step} exited with 137" in out
+    worker = int(Path(f"{tmp_path / 'log'}.{step}.worker").read_text())
+    assert not _alive(worker)                                      # the group, not just python
+
+
+def test_wrapper_watchdog_is_cancelled_when_the_step_stops_by_itself(tmp_path):
+    """Prompt exit after USR1: one requeue, nothing killed, and no watchdog left behind (a
+    leftover would hold this test's pipe open for its whole 40 s)."""
+    t0 = time.time()
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True}}, signal_step="train",
+                            env_extra={"ROADSEG_USR1_WATCHDOG": "40"})
+    assert rc == 0 and time.time() - t0 < 20, out
+    assert log[1:] == ["train got SIGTERM", "scontrol requeue 777_4"], out
+    assert "watchdog:" not in out and "train exited with 75" in out
+
+
+@pytest.mark.parametrize("signals", [(signal.SIGTERM,), (signal.SIGUSR1, signal.SIGTERM)])
+def test_wrapper_watchdog_never_fires_after_term(tmp_path, signals):
+    """TERM (scancel / preemption) -- alone or after USR1 -- means: no kill by us, no requeue.
+    The step outlives the 1 s watchdog delay and ends by itself with its own exit code."""
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True, "linger": 3}},
+                            signal_step="train", signum=signals,
+                            env_extra={"ROADSEG_USR1_WATCHDOG": "1"})
+    assert rc != 0 and _requeues(log) == [], out
+    assert "watchdog:" not in out and "train exited with 75" in out and "not requeueing" in out
 
 
 def test_wrapper_stops_after_20_restarts_without_requeueing(tmp_path):

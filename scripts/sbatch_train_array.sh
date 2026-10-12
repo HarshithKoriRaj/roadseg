@@ -148,18 +148,71 @@ forward() {
         kill -TERM "$child" 2>/dev/null || true
     fi
 }
-on_usr1() { got_usr1=1; forward "USR1 (time limit in 180 s)"; }
-on_term() { got_term=1; forward "TERM (scancel or preemption)"; }
+
+# ---- time-limit watchdog -----------------------------------------------------------------
+# USR1 leaves 180 s. A python that does not stop in time (the finish phase's validation
+# scoring cannot be interrupted) would run into the limit: the job ends TIMEOUT and nobody
+# requeues it. So WATCHDOG_SECONDS after USR1 was forwarded, a step that is still running is
+# SIGKILLed -- its whole process group, DataLoader workers included -- and the task is
+# requeued. That is safe: every file appears by an atomic rename, and resuming after a kill at
+# any instant is what the kill-sweep tests establish. Cancelled when the step ends by itself;
+# never fires after TERM.
+WATCHDOG_SECONDS="${ROADSEG_USR1_WATCHDOG:-120}"
+watchdog=""          # pid of the pending watchdog
+watchdog_fired=0
+start_watchdog() {
+    if [[ -n "$watchdog" || -z "$child" ]] || (( got_term )); then
+        return
+    fi
+    ( trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+      sleep "$WATCHDOG_SECONDS" &
+      nap=$!
+      wait "$nap" && kill -USR2 "$$" 2>/dev/null ) &
+    watchdog=$!
+}
+stop_watchdog() {
+    if [[ -n "$watchdog" ]]; then
+        kill -TERM "$watchdog" 2>/dev/null || true
+        wait "$watchdog" 2>/dev/null || true
+        watchdog=""
+    fi
+}
+on_watchdog() {
+    watchdog=""
+    if (( got_term )) || [[ -z "$child" ]] || ! kill -0 "$child" 2>/dev/null; then
+        return                             # TERM takes precedence; or the step is already gone
+    fi
+    watchdog_fired=1
+    echo "watchdog: pid $child is still running ${WATCHDOG_SECONDS} s after USR1 was forwarded;" \
+         "SIGKILL to its process group (the state on disk is kill-safe), then requeue"
+    kill -KILL -- "-$child" 2>/dev/null || true     # the group (the step runs under setsid)
+    pkill -KILL -P "$child" 2>/dev/null || true     # ... and, without setsid, its children
+    kill -KILL "$child" 2>/dev/null || true
+}
+
+on_usr1() { got_usr1=1; forward "USR1 (time limit in 180 s)"; start_watchdog; }
+on_term() { got_term=1; stop_watchdog; forward "TERM (scancel or preemption)"; }
 trap on_usr1 USR1
 trap on_term TERM
+trap on_watchdog USR2
+
+# Each step is the leader of its own process group, so the watchdog can kill all of it.
+# (SLURM tracks the job by cgroup, so its own signals still reach every process.)
+SETSID=()
+if command -v setsid > /dev/null 2>&1; then
+    SETSID=(setsid)
+fi
 
 # run_step cmd...  -> STEP_RC = the command's own exit status
 run_step() {
     local rc=0
-    "$@" &
+    ${SETSID[@]+"${SETSID[@]}"} "$@" &
     child=$!
     if (( got_usr1 || got_term )); then    # the signal landed before $child was known
         kill -TERM "$child" 2>/dev/null || true
+        if (( got_usr1 )); then
+            start_watchdog
+        fi
     fi
     STEP_RC=0
     wait "$child" || STEP_RC=$?
@@ -168,6 +221,7 @@ run_step() {
         STEP_RC=0
         wait "$child" || STEP_RC=$?
     done
+    stop_watchdog
     # If the child exited between the interrupted `wait` and the check above, STEP_RC is
     # still the interruption; its real status is waiting to be collected (127 = already was).
     wait "$child" 2>/dev/null || rc=$?
@@ -205,6 +259,8 @@ run_step "$PY" -m roadseg.train --config "$CODE/configs/${DATASET}.yaml" "${SELE
 echo "train exited with $STEP_RC"
 if (( got_term )); then
     terminated "training"
+elif (( watchdog_fired )); then
+    requeue "time limit: train did not stop within ${WATCHDOG_SECONDS} s of USR1 and was killed"
 elif (( got_usr1 )) && (( STEP_RC == 75 || STEP_RC == 143 || STEP_RC == 0 )); then
     # 75: checkpoint saved. 143: killed by the forwarded signal before its handlers existed
     # (still importing). 0: training finished in the grace period, but 180 s cannot score it.
@@ -231,6 +287,8 @@ elif (( STEP_RC == 2 )) && [[ -s "$RUN/test_metrics.json" ]]; then
     echo "already scored: $RUN/test_metrics.json exists; nothing to do"
 elif (( got_term )); then
     terminated "test scoring"
+elif (( watchdog_fired )); then
+    requeue "time limit: eval did not stop within ${WATCHDOG_SECONDS} s of USR1 and was killed; nothing was written"
 elif (( got_usr1 && STEP_RC == 143 )); then
     requeue "time limit during test scoring (eval killed by the signal); nothing was written"
 else
