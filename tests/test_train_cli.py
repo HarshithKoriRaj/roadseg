@@ -905,6 +905,46 @@ def test_kill_at_every_point_then_resume_reaches_the_uninterrupted_result(tiny, 
         assert m["resumes"] == resumes, what
 
 
+def test_a_second_kill_during_the_resume_is_also_harmless(tiny, monkeypatch):
+    """Preempted again while resuming -- including inside the best.pt repair and the
+    history rewrite that a resume starts with -- and then left alone: same result."""
+    faults = Faults(monkeypatch)
+    cfg = tiny.cfg(epochs=3, max_train_batches=3, ckpt_minutes=0)
+    run = tiny.runs / "massachusetts_R1_s0"
+    faults.arm(None)
+    assert tiny.train(cfg=cfg) == 0
+    events = list(faults.events)
+    ref = (weights_digest(run / "best.pt"), weights_digest(run / "latest.pt"),
+           [(r["epoch"], r["val_iou"], r["lr"]) for r in read(run / "history.json")],
+           read(run / "metrics.json")["threshold"])
+    best_renames = [i for i, e in enumerate(events) if e == "replace:best.pt"]
+    pairs = [(k1, k2) for k1 in best_renames for k2 in range(8)]             # repair interrupted
+    pairs += [(k1, k2) for k1 in range(2, len(events), 9) for k2 in (3, 11)]  # arbitrary pairs
+    for k1, k2 in pairs:
+        shutil.rmtree(tiny.runs)
+        published = []
+        for kill_at, flags in ((k1, ()), (k2, ("--resume", "auto"))):
+            faults.arm(kill_at)
+            try:
+                tiny.train(*flags, cfg=cfg)
+            except Kill:
+                pass
+            published += faults.published
+            assert_nothing_partial_is_visible(run)
+        faults.arm(None)
+        assert tiny.train("--resume", "auto", cfg=cfg) == 0, (k1, k2)
+        published += faults.published
+        assert published.count("metrics.json") == 1, (k1, k2)
+        assert sorted(p.name for p in run.iterdir()) == ["best.pt", "history.json", "latest.pt",
+                                                         "metrics.json"], (k1, k2)
+        m = read(run / "metrics.json")
+        got = (weights_digest(run / "best.pt"), weights_digest(run / "latest.pt"),
+               [(r["epoch"], r["val_iou"], r["lr"]) for r in read(run / "history.json")],
+               m["threshold"])
+        assert got == ref, (k1, k2)
+        assert m["history"] == read(run / "history.json"), (k1, k2)
+
+
 def test_best_pt_is_repaired_when_killed_between_latest_and_best(tiny, monkeypatch, capsys):
     """The one window where the two checkpoints can disagree, exercised explicitly."""
     faults = Faults(monkeypatch)
@@ -1153,8 +1193,31 @@ def test_cli_rejects_unknown_rung_subprocess():
     assert r.returncode != 0 and "unknown rung" in r.stderr
 
 
+def _memory_limit_gib() -> float:
+    """Smallest cgroup-v2 memory.max above this process (inf if none)."""
+    limit = float("inf")
+    try:
+        rel = Path("/proc/self/cgroup").read_text().strip().splitlines()[-1].split("::", 1)[1]
+        node = Path("/sys/fs/cgroup") / rel.lstrip("/")
+        while str(node).startswith("/sys/fs/cgroup"):
+            f = node / "memory.max"
+            if f.is_file() and f.read_text().strip() != "max":
+                limit = min(limit, int(f.read_text()) / 2 ** 30)
+            node = node.parent
+    except (OSError, IndexError, ValueError):
+        pass
+    return limit
+
+
 needs_data = pytest.mark.skipif(not (REAL_MASS / "train").is_dir(),
                                 reason="Massachusetts data not present")
+# A ResNeXt-50 U-Net with AdamW state needs ~2 GB next to the pytest process. The login node
+# caps a whole user session at 3 GiB and OOM-kills past it; run these on a compute node
+# (sbatch scripts/sbatch_tests.sh tests/test_train_cli.py -m slow).
+needs_ram = pytest.mark.skipif(
+    _memory_limit_gib() < 8,
+    reason=f"needs ~4 GiB; this session's cgroup allows {_memory_limit_gib():.1f} GiB "
+           f"(run on a compute node)")
 SMALL_TRAIN = ["--rung", "R1", "--no-pretrained", "--limit-train", "4", "--limit-val", "1",
                "--batch-size", "2", "--workers", "0", "--tile", "128", "--device", "cpu",
                "--no-amp"]
@@ -1165,8 +1228,55 @@ def _cli(module, *args, timeout=1500):
                           env=ENV, cwd=ROOT, timeout=timeout)
 
 
+class Flat(nn.Module):
+    """One trainable bias: predicts 'no road' everywhere, so the metrics stay cheap."""
+
+    def __init__(self):
+        super().__init__()
+        self.bias = nn.Parameter(torch.tensor(-3.0))
+
+    def forward(self, x):
+        return self.bias + 0.0 * x[:, :1]
+
+
 @pytest.mark.slow
 @needs_data
+def test_real_data_pipeline_with_a_stub_model(tmp_path, monkeypatch, capsys):
+    """Real Massachusetts imagery (1500x1500 TIFFs, real no-data regions, the real val and
+    test splits) through train -> finish -> test scoring, in-process with a one-parameter
+    model: light enough for the login node, where the real-model tests below cannot run."""
+    rec = _record_training(monkeypatch)
+    monkeypatch.setattr(tr, "build_model", lambda cfg: Flat())
+    monkeypatch.setattr(ev, "build_model", lambda cfg: Flat())
+    args = ["--config", str(ROOT / "configs/massachusetts.yaml"), "--rung", "R1", "--epochs", "2",
+            "--max-train-batches", "3", "--limit-train", "4", "--limit-val", "1", "--batch-size",
+            "2", "--workers", "0", "--tile", "128", "--device", "cpu", "--no-amp", "--runs-dir",
+            str(tmp_path)]
+    assert tr.main(args) == 0
+    assert set(rec["splits"]) == {"train", "val"}                   # preload=true decoded these
+    run = tmp_path / "massachusetts_R1_s0"
+    m = read(run / "metrics.json")
+    assert METRICS_KEYS <= set(m) and len(read(run / "history.json")) == 2
+    assert (m["cfg"]["tile"], m["cfg"]["stride"], m["cfg"]["val_stride"]) == (128, 64, 128)
+    assert (m["n_train_images"], m["n_val_images"], m["steps_per_epoch"]) == (4, 1, 3)
+    row = m["per_image"][0]
+    assert 0 < row["n_valid"] <= 1500 * 1500 and row["n_gt"] > 0 and row["n_pred"] == 0
+    assert {"apls", "cl_dice", "iou"} <= set(row)
+    capsys.readouterr()
+    assert tr.main(args) == 0 and "already complete" in capsys.readouterr().out
+
+    score = ["--run", str(run), "--split", "test", "--tile", "128", "--stride", "64", "--limit",
+             "1", "--workers", "0"]
+    assert ev.main(score) == 0
+    t = read(run / "test_metrics.json")
+    assert t["protocol"] == "nonstandard" and len(t["per_image"]) == 1
+    assert t["per_image"][0]["id"] != row["id"]                     # a test image, not the val one
+    assert ev.main(score) == 2
+
+
+@pytest.mark.slow
+@needs_data
+@needs_ram
 def test_real_data_end_to_end(tmp_path):
     """Real ResNeXt, real Massachusetts images, the real CLI: train -> idempotent rerun ->
     score the test split once."""
@@ -1198,6 +1308,7 @@ def test_real_data_end_to_end(tmp_path):
 
 @pytest.mark.slow
 @needs_data
+@needs_ram
 def test_real_data_sigterm_mid_epoch_then_resume(tmp_path):
     """A5 (2): SIGTERM the real CLI mid-epoch -> exit 75 with a mid-epoch latest.pt;
     --resume auto finishes the run."""
