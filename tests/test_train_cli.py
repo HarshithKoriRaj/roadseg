@@ -10,6 +10,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -1716,7 +1717,8 @@ def _launch_repo(tmp_path):
     repo = tmp_path / "project"
     (repo / "scripts").mkdir(parents=True)
     (repo / "src" / "roadseg").mkdir(parents=True)
-    for name in ("sbatch_train_array.sh", "sbatch_aggregate.sh", "sbatch_canary.sh"):
+    for name in ("sbatch_train_array.sh", "sbatch_aggregate.sh", "sbatch_canary.sh",
+                 "sbatch_smoke_cpu.sh"):
         (repo / "scripts" / name).write_text(f"#!/bin/bash\necho {name}\n")
     (repo / "src" / "roadseg" / "train.py").write_text("VERSION = 1\n")
     (repo / ".gitignore").write_text("releases/\nruns/\nruns_smoke/\n")
@@ -1795,6 +1797,66 @@ def test_launch_requires_the_cpu_rehearsal_to_have_passed_at_this_commit(tmp_pat
     assert rc == 0 and "WARNING --no-smoke-check" in err and "WITHOUT a passed CPU rehearsal" in err
     rc, out, err, calls = _launch(tmp_path, repo, "--bogus", smoke=sha)
     assert rc == 2 and calls == [] and "unknown argument" in err
+
+
+def test_launch_smoke_runs_the_rehearsal_from_a_snapshot_not_from_the_live_tree(tmp_path):
+    """H7. A rehearsal that imports the working tree forbids editing it for an hour (and was
+    corrupted once by an edit). `launch.sh --smoke` freezes HEAD and rehearses the snapshot."""
+    repo, sha, short = _launch_repo(tmp_path)
+    snap = repo / "releases" / short
+    export = f"--export=ALL,ROADSEG_CODE={snap}"
+    rc, out, err, calls = _launch(tmp_path, repo, "--smoke", "--dry-run", smoke=None)
+    assert rc == 0, out + err                           # needs no earlier acknowledgement
+    assert f"snapshot: {snap} (would be created" in out and "DRY RUN" in out
+    assert out.count("would run:") == 1 and calls == []
+    assert f"would run: {tmp_path / 'fake_sbatch'} --parsable {export} {snap}/scripts/sbatch_smoke_cpu.sh" in out
+    assert not (repo / "releases").exists() and not (repo / "runs").exists()
+
+    rc, out, err, calls = _launch(tmp_path, repo, "--smoke", smoke=None)
+    assert rc == 0, out + err
+    assert (snap / "COMMIT").read_text().strip() == sha
+    assert calls[0] == f"sbatch --parsable {export} {snap}/scripts/sbatch_smoke_cpu.sh"
+    assert len([c for c in calls if c.startswith("sbatch")]) == 1            # the rehearsal only
+    assert "smoke job: 9001" in out and "SMOKE_PASSED" in out
+    assert (repo / "runs" / "LAUNCHES.log").read_text().strip().endswith(
+        f"sha={sha} snapshot={snap} smoke=9001")
+
+    rc, out, err, calls = _launch(tmp_path, repo, "--smoke", "--canary", "--dry-run", smoke=sha)
+    assert rc == 2 and "one of" in err                  # one job kind per launch
+    (repo / "src" / "roadseg" / "train.py").write_text("VERSION = 2\n")
+    rc, out, err, calls = _launch(tmp_path, repo, "--smoke", "--dry-run", smoke=None)
+    assert rc == 2 and "dirty" in err                   # a rehearsal, too, runs a commit
+
+
+def test_every_script_that_runs_python_takes_its_code_from_roadseg_code(tmp_path):
+    """H7. src and configs come from $ROADSEG_CODE in every job script; and the real smoke
+    script, pointed at a snapshot, reports (and would acknowledge) the snapshot's commit."""
+    for name in ("sbatch_train_array.sh", "sbatch_aggregate.sh", "sbatch_smoke_cpu.sh",
+                 "sbatch_canary.sh"):
+        text = (ROOT / "scripts" / name).read_text()
+        assert 'CODE="${ROADSEG_CODE:-$PROJECT}"' in text, name
+        assert 'export PYTHONPATH="$PROJECT/.deps:$CODE/src"' in text, name
+        assert "$PROJECT/src" not in text and "$PROJECT/configs" not in text, name
+        assert "$PROJECT/scripts" not in text, name
+        configs = re.findall(r'--config "?([^ "]+)', text) + re.findall(r"_base: (\S+)", text)
+        assert configs or name == "sbatch_aggregate.sh", name      # (aggregation reads none)
+        assert all(c.startswith(("$CODE/configs/", "$RUNS/", "$DRILL/")) for c in configs), (
+            name, configs)
+    assert 'bash "$CODE/scripts/sbatch_train_array.sh" --print-map' in (
+        ROOT / "scripts" / "sbatch_aggregate.sh").read_text()
+    # the test runner is the exception, on purpose: it tests the tree it lives in
+    assert "unset ROADSEG_CODE" in (ROOT / "scripts" / "pytest.sh").read_text()
+
+    snap = tmp_path / "releases" / "abc1234"
+    (snap / "src" / "roadseg").mkdir(parents=True)
+    (snap / "COMMIT").write_text(SHA_A + "\n")
+    runs = tmp_path / "runs_smoke"
+    r = subprocess.run(["bash", str(SMOKE)], capture_output=True, text=True,
+                       env=dict(ENV, ROADSEG_CODE=str(snap), ROADSEG_RUNS_SMOKE=str(runs),
+                                SMOKE_STEPS="none"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"code {snap}  commit {SHA_A}" in r.stdout
+    assert "SMOKE_PASSED not written" in r.stdout       # (narrowed here: no section ran)
 
 
 def test_launch_freezes_a_snapshot_and_submits_from_it(tmp_path):

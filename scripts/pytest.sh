@@ -2,6 +2,9 @@
 set -euo pipefail
 PROJECT=/scratch/hk4488/roadseg
 PY=/scratch/hk4488/.conda/envs/unsloth_sft/bin/python
+# The tests test the tree they live in (their fixtures are built from this tree's paths), so
+# unlike the job scripts this one deliberately does NOT follow a frozen snapshot:
+unset ROADSEG_CODE
 export PYTHONPATH="$PROJECT/.deps:$PROJECT/src:${PYTHONPATH:-}"
 export TORCH_HOME=/scratch/hk4488/.cache/torch
 # Shared nodes: letting torch spawn one thread per core oversubscribes badly

@@ -3,13 +3,18 @@
 # a hand-submitted task imports whatever is in the live repository each time it is requeued.
 #
 #   bash scripts/launch.sh --dry-run     # show what would happen; creates and submits nothing
+#   bash scripts/launch.sh --smoke       # CPU rehearsal only (scripts/sbatch_smoke_cpu.sh, ~75 min)
 #   bash scripts/launch.sh --canary      # GPU canary only (scripts/sbatch_canary.sh, ~40 min)
 #   bash scripts/launch.sh               # the 36-task array + the aggregation job behind it
+#
+# Every job kind runs from the same frozen snapshot, the rehearsal included: nothing that is
+# submitted here reads the working tree, so the tree may be edited while jobs run.
 #
 # What it does:
 #   1. refuses a dirty tree (`git status --porcelain` non-empty): what runs must be a commit;
 #   2. refuses unless the CPU rehearsal passed AT THIS COMMIT: runs_smoke/SMOKE_PASSED, written
-#      by scripts/sbatch_smoke_cpu.sh, must hold HEAD's sha (--no-smoke-check overrides, loudly);
+#      by the rehearsal (--smoke), must hold HEAD's sha (--no-smoke-check overrides, loudly;
+#      --smoke itself needs no acknowledgement);
 #   3. freezes the code: releases/<short sha>/ = `git archive HEAD`, plus a COMMIT file with
 #      the full sha (reused if it already exists; read-only);
 #   4. submits FROM the snapshot with --export=ALL,ROADSEG_CODE=<snapshot>, so every task and
@@ -35,16 +40,25 @@ SLURM_LOGS="${ROADSEG_SLURM_LOGS:-/scratch/hk4488/logs/roadseg}"
 
 dry=0
 canary=0
+smoke=0
 smoke_check=1
 for arg in "$@"; do
     case "$arg" in
         --dry-run) dry=1 ;;
         --canary) canary=1 ;;
+        --smoke) smoke=1 ;;
         --no-smoke-check) smoke_check=0 ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "launch.sh: unknown argument '$arg' (see --help)" >&2; exit 2 ;;
     esac
 done
+if (( smoke && canary )); then
+    echo "launch.sh: give one of --smoke and --canary, not both (one job kind per launch)" >&2
+    exit 2
+fi
+if (( smoke )); then
+    smoke_check=0                       # the rehearsal is what produces the acknowledgement
+fi
 
 refuse() { echo "launch.sh: REFUSED - $*" >&2; exit 2; }
 
@@ -60,12 +74,15 @@ fi
 # ---- 2. the CPU rehearsal passed at this commit ----------------------------------------------
 if (( smoke_check )); then
     [[ -f "$SMOKE_FLAG" ]] || refuse "no $SMOKE_FLAG: the CPU rehearsal has not passed. Run" \
-        "'sbatch scripts/sbatch_smoke_cpu.sh' at this commit ($short) and wait for 'SMOKE: ALL PASSED'" \
+        "'bash scripts/launch.sh --smoke' at this commit ($short) and wait for 'SMOKE: ALL PASSED'" \
         "(--no-smoke-check overrides)."
     smoked=$(tr -d '[:space:]' < "$SMOKE_FLAG")
     [[ "$smoked" == "$sha" ]] || refuse "the CPU rehearsal passed at ${smoked:-<empty>}, but HEAD" \
-        "is $sha. Rehearse this commit first (--no-smoke-check overrides)."
+        "is $sha. Rehearse this commit first: 'bash scripts/launch.sh --smoke'" \
+        "(--no-smoke-check overrides)."
     echo "smoke: rehearsal passed at $short"
+elif (( smoke )); then
+    echo "smoke: submitting the CPU rehearsal of $short itself"
 else
     echo "launch.sh: WARNING --no-smoke-check: submitting $short WITHOUT a passed CPU rehearsal" \
          "at this commit. Every failure the rehearsal would have caught now costs GPU queue time." >&2
@@ -121,7 +138,13 @@ else
     mkdir -p "$SLURM_LOGS" "$(dirname "$LAUNCH_LOG")"       # SLURM does not create the log dir
 fi
 
-if (( canary )); then
+if (( smoke )); then
+    submit smoke "$EXPORT" "$SNAP/scripts/sbatch_smoke_cpu.sh"
+    jid=$JOB
+    echo "smoke job: $jid   (log: $SLURM_LOGS/roadseg-smoke_$jid.out; ends with 'SMOKE: ALL PASSED'" \
+         "and writes $SMOKE_FLAG, which a launch of this commit requires)"
+    line="$stamp sha=$sha snapshot=$SNAP smoke=$jid"
+elif (( canary )); then
     submit canary "$EXPORT" "$SNAP/scripts/sbatch_canary.sh"
     jid=$JOB
     echo "canary job: $jid   (log: $SLURM_LOGS/roadseg-canary_$jid.out; ends with 'CANARY: ALL PASSED')"

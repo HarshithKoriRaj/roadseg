@@ -12,10 +12,14 @@
 #
 # End-to-end CPU rehearsal of everything the GPU array will do, on real data with real
 # ImageNet weights, in miniature (2 epochs x 3 steps, 8 training / 2 validation / 3 test
-# images, tile 256). Run it AT THE COMMIT YOU WILL LAUNCH, from a clean tree, and do not
-# commit while it runs:
+# images, tile 256). Submit it through the launcher, which freezes HEAD into a snapshot and
+# rehearses THAT (all code -- src and configs -- comes from $ROADSEG_CODE), so the working
+# tree may be edited while it runs:
 #
-#   sbatch scripts/sbatch_smoke_cpu.sh        # ends with "SMOKE: ALL PASSED" or stops at the failure
+#   bash scripts/launch.sh --smoke            # ends with "SMOKE: ALL PASSED" or stops at the failure
+#
+# (Run by hand without ROADSEG_CODE it rehearses the live tree: then the tree must be clean
+# and must not change until it ends, or no acknowledgement is written.)
 #
 # On success it writes $RUNS/SMOKE_PASSED holding the commit it rehearsed; scripts/launch.sh
 # refuses to submit any other commit. The acknowledgement is written only by the full default
