@@ -330,3 +330,53 @@ def test_cli_val_split_does_not_trigger_guard(tmp_path, monkeypatch):
     _patch(monkeypatch)
     assert ev.main(["--run", str(run), "--split", "val", *SMALL]) == 0
     assert (run / "val_metrics.json").exists()
+
+
+class DtypeProbe(nn.Module):
+    """A real conv so autocast has something to cast; records the dtype it produced."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 1, 1)
+        self.seen = []
+
+    def forward(self, x):
+        out = self.conv(x)
+        self.seen.append(out.dtype)
+        return out
+
+
+def test_use_amp_defaults_to_fp32_on_cpu_and_true_selects_cpu_bf16():
+    m = DtypeProbe()
+    img = np.zeros((32, 32, 3), np.float32)
+    predict_full(m, img, tile=32, stride=32, device="cpu")
+    predict_full(m, img, tile=32, stride=32, device="cpu", use_amp=False)
+    p = predict_full(m, img, tile=32, stride=32, device="cpu", use_amp=True)
+    assert m.seen == [torch.float32, torch.float32, torch.bfloat16]
+    assert p.dtype == np.float32                      # probabilities stay fp32 either way
+
+
+def test_use_amp_reaches_evaluate_and_select_threshold():
+    m = DtypeProbe()
+    ds = TinyDS([_rows(16, 16, "a")])
+    evaluate(m, ds, 0.5, use_amp=True, full_metrics=False, **KW)
+    select_threshold(m, ds, use_amp=True, **KW)
+    evaluate(m, ds, 0.5, full_metrics=False, **KW)
+    assert m.seen == [torch.bfloat16, torch.bfloat16, torch.float32]  # one forward per call
+
+
+@pytest.mark.parametrize("amp", [True, False, None])
+def test_cli_scores_with_the_runs_recorded_amp_setting(tmp_path, monkeypatch, amp):
+    """The test split must go through the same precision path that picked the threshold."""
+    cfg = dict(CFG) if amp is None else {**CFG, "amp": amp}
+    run = _fake_run(tmp_path, cfg=cfg)
+    _patch(monkeypatch)
+    real, seen = ev.evaluate, {}
+
+    def spy(*a, **k):
+        seen.update(k)
+        return real(*a, **{**k, "use_amp": False})
+
+    monkeypatch.setattr(ev, "evaluate", spy)
+    assert ev.main(["--run", str(run), "--split", "test", *SMALL]) == 0
+    assert seen["use_amp"] is amp

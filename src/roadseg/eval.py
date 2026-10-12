@@ -36,10 +36,17 @@ _ROW_NONMETRIC = ("id", "n_valid", "tp", "fp", "fn", "n_gt", "n_pred")
 
 @torch.no_grad()
 def predict_full(model, img: np.ndarray, tile: int = 512, stride: int = 256,
-                 device: str = "cuda", batch: int = 8) -> np.ndarray:
-    """Sigmoid probabilities [H,W] float32 for a whole image via overlapped tiles."""
+                 device: str = "cuda", batch: int = 8,
+                 use_amp: bool | None = None) -> np.ndarray:
+    """Sigmoid probabilities [H,W] float32 for a whole image via overlapped tiles.
+
+    `use_amp` None means bf16 autocast on CUDA and none on CPU; True on a CPU
+    device selects CPU bf16 autocast (smoke rehearsal of the mixed-precision path).
+    """
     was_training = model.training
     model.eval()
+    is_cuda = str(device).startswith("cuda")
+    amp = is_cuda if use_amp is None else bool(use_amp)
     try:
         h, w = img.shape[:2]
         tiles, pos = tile_image(img, tile, stride)
@@ -47,8 +54,8 @@ def predict_full(model, img: np.ndarray, tile: int = 512, stride: int = 256,
         for i in range(0, len(tiles), batch):
             chunk = np.stack(tiles[i:i + batch])                       # [B,T,T,3]
             x = torch.from_numpy(chunk).permute(0, 3, 1, 2).to(device).float()
-            with torch.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=str(device).startswith("cuda")):
+            with torch.autocast(device_type="cuda" if is_cuda else "cpu",
+                                dtype=torch.bfloat16, enabled=amp):
                 logits = model(x)
             probs.extend(torch.sigmoid(logits.float())[:, 0].cpu().numpy())   # sigmoid in fp32
         return stitch(probs, pos, h, w, tile)
@@ -57,7 +64,7 @@ def predict_full(model, img: np.ndarray, tile: int = 512, stride: int = 256,
 
 
 def _score_images(model, dataset, threshold, device, tile, stride, batch, full_metrics,
-                  with_apls, workers):
+                  with_apls, workers, use_amp=None):
     """Yield (item_id, row) in dataset order. Predictions run here; CPU metrics may be pooled."""
     thr = np.float32(threshold)
     n = len(dataset)
@@ -65,7 +72,7 @@ def _score_images(model, dataset, threshold, device, tile, stride, batch, full_m
         for i in range(n):
             item = dataset[i]
             prob = predict_full(model, item["image"], tile=tile, stride=stride,
-                                device=device, batch=batch)
+                                device=device, batch=batch, use_amp=use_amp)
             yield item["id"], image_metrics(prob >= thr, item["mask"], item["valid"],
                                             full_metrics, with_apls)
         return
@@ -75,7 +82,7 @@ def _score_images(model, dataset, threshold, device, tile, stride, batch, full_m
         for i in range(n):
             item = dataset[i]
             prob = predict_full(model, item["image"], tile=tile, stride=stride,
-                                device=device, batch=batch)
+                                device=device, batch=batch, use_amp=use_amp)
             fut = pool.submit(image_metrics, prob >= thr, item["mask"], item["valid"],
                               True, with_apls)
             pending.append((item["id"], fut))
@@ -90,8 +97,8 @@ def _score_images(model, dataset, threshold, device, tile, stride, batch, full_m
 @torch.no_grad()
 def evaluate(model, dataset, threshold: float = 0.5, device: str = "cuda", *,
              tile: int = 512, stride: int = 256, full_metrics: bool = True,
-             with_apls: bool = False, batch: int = 8, workers: int = 0
-             ) -> tuple[dict, list[dict]]:
+             with_apls: bool = False, batch: int = 8, workers: int = 0,
+             use_amp: bool | None = None) -> tuple[dict, list[dict]]:
     """Score `dataset` at `threshold`. Returns (aggregate, per-image rows).
 
     full_metrics=False (per-epoch checkpoint selection) computes only the pixel
@@ -105,7 +112,7 @@ def evaluate(model, dataset, threshold: float = 0.5, device: str = "cuda", *,
     rows = []
     try:
         for iid, r in _score_images(model, dataset, threshold, device, tile, stride, batch,
-                                    full_metrics, with_apls, workers):
+                                    full_metrics, with_apls, workers, use_amp):
             for k in ("tp", "fp", "fn"):
                 pooled[k] += r[k]
             pooled["tn"] += r["n_valid"] - r["tp"] - r["fp"] - r["fn"]
@@ -128,7 +135,8 @@ def evaluate(model, dataset, threshold: float = 0.5, device: str = "cuda", *,
 @torch.no_grad()
 def select_threshold(model, dataset, device: str = "cuda", *, tile: int = 512,
                      stride: int = 256, batch: int = 8,
-                     grid=np.round(np.linspace(0.20, 0.80, 13), 2)) -> tuple[float, float]:
+                     grid=np.round(np.linspace(0.20, 0.80, 13), 2),
+                     use_amp: bool | None = None) -> tuple[float, float]:
     """Pick the decision threshold maximising pooled IoU. Pass VALIDATION data only.
 
     Returns (best_threshold, best_pooled_iou). One pass over the images; only the
@@ -139,7 +147,7 @@ def select_threshold(model, dataset, device: str = "cuda", *, tile: int = 512,
     for i in range(len(dataset)):
         d = dataset[i]
         prob = predict_full(model, d["image"], tile=tile, stride=stride,
-                            device=device, batch=batch)
+                            device=device, batch=batch, use_amp=use_amp)
         for t, a in zip(ts, agg):
             for k, v in confusion(prob >= np.float32(t), d["mask"], d["valid"]).items():
                 a[k] += v
@@ -228,7 +236,8 @@ def main(argv=None) -> int:
         dataset = _Limited(dataset, a.limit)
 
     agg, rows = evaluate(model, dataset, threshold, device, tile=a.tile, stride=a.stride,
-                         full_metrics=True, with_apls=not a.no_apls, workers=a.workers)
+                         full_metrics=True, with_apls=not a.no_apls, workers=a.workers,
+                         use_amp=cfg.get("amp"))     # same precision path that picked the threshold
     standard = a.limit is None and a.tile == 512 and a.stride == 256
     ev = {"tile": a.tile, "stride": a.stride, "with_apls": not a.no_apls, "forced": a.force,
           "limit": a.limit, "checkpoint_epoch": ck.get("epoch"),

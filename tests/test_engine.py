@@ -112,6 +112,88 @@ def test_max_batches_limits_batches_run():
     assert len(seen) == 2
 
 
+def test_max_batches_never_fetches_an_extra_batch():
+    """A fetched-and-dropped batch costs a full batch of crops and, worse, advances
+    the data stream past what was trained on."""
+    m = _Tiny(); opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    fetched = []
+    def loader():
+        for i, b in enumerate(_batches(5)):
+            fetched.append(i)
+            yield b
+    train_one_epoch(m, loader(), ComboLoss(), opt, use_amp=False, device="cpu", max_batches=2)
+    assert fetched == [0, 1]
+
+
+def test_nonfinite_gradient_raises_before_the_weights_are_touched():
+    """A finite loss with a NaN gradient would otherwise poison every weight silently."""
+    m = _Tiny(); opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    before = {k: v.clone() for k, v in m.state_dict().items() if v.is_floating_point()}
+    def loss_fn(logits, mask, valid):
+        return torch.sqrt(logits.pow(2).sum() * 0.0)       # value 0.0, gradient inf * 0 = NaN
+    with pytest.raises(FloatingPointError, match="non-finite gradient at batch 0"):
+        train_one_epoch(m, _batches(2), loss_fn, opt, use_amp=False, device="cpu")
+    for k, v in before.items():
+        if "running_" in k:
+            continue                                        # BN statistics move in forward()
+        torch.testing.assert_close(m.state_dict()[k], v, rtol=0, atol=0)
+
+
+def test_on_step_sees_every_step_and_can_stop_the_epoch():
+    m = _Tiny(); opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: 1.0)
+    seen = []
+    def on_step(i, loss):
+        seen.append((i, sched.last_epoch, loss))            # called AFTER optimizer + scheduler
+        return i == 2
+    out = train_one_epoch(m, _batches(6), ComboLoss(), opt, use_amp=False, device="cpu",
+                          scheduler=sched, on_step=on_step)
+    assert [s[0] for s in seen] == [0, 1, 2]
+    assert [s[1] for s in seen] == [1, 2, 3]
+    assert out == pytest.approx(sum(s[2] for s in seen) / 3)
+
+
+def test_checkpoint_extra_roundtrips_and_defaults_to_empty(tmp_path):
+    p = tmp_path / "ck.pt"
+    save_checkpoint(p, _Tiny(), epoch=3, best=0.5, cfg={},
+                    extra={"step_in_epoch": 4, "history": [{"epoch": 0, "val_iou": 0.5}]})
+    meta = load_checkpoint(p, _Tiny())
+    assert meta["extra"] == {"step_in_epoch": 4, "history": [{"epoch": 0, "val_iou": 0.5}]}
+    save_checkpoint(p, _Tiny(), epoch=3, best=0.5, cfg={})
+    assert load_checkpoint(p, _Tiny())["extra"] == {}
+
+
+def test_failed_save_leaves_the_previous_checkpoint_intact(tmp_path, monkeypatch):
+    """Killed between writing the temp file and the rename: the old file must survive whole."""
+    import roadseg.engine as eng
+    p = tmp_path / "ck.pt"
+    save_checkpoint(p, _Tiny(), epoch=1, best=0.1, cfg={})
+    def boom(src, dst):
+        raise KeyboardInterrupt("killed before the rename")
+    monkeypatch.setattr(eng.os, "replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        save_checkpoint(p, _Tiny(), epoch=2, best=0.2, cfg={})
+    monkeypatch.undo()
+    assert load_checkpoint(p, _Tiny())["epoch"] == 1
+    save_checkpoint(p, _Tiny(), epoch=3, best=0.3, cfg={})   # a stale temp file does not block
+    assert load_checkpoint(p, _Tiny())["epoch"] == 3
+    assert [f.name for f in tmp_path.iterdir()] == ["ck.pt"]
+
+
+def test_cpu_bf16_autocast_is_selected_on_cpu():
+    """use_amp on a CPU device runs the forward under CPU bf16 autocast (smoke rehearsal)."""
+    seen = []
+    class Probe(_Tiny):
+        def forward(self, x):
+            out = super().forward(x)
+            seen.append(out.dtype)
+            return out
+    m = Probe(); opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    train_one_epoch(m, _batches(1), ComboLoss(), opt, use_amp=True, device="cpu")
+    train_one_epoch(m, _batches(1), ComboLoss(), opt, use_amp=False, device="cpu")
+    assert seen == [torch.bfloat16, torch.float32]
+
+
 def test_loss_ignores_invalid_pixels_in_train_step():
     """valid must reach the loss: garbage labels under valid==0 cannot change the step."""
     def run(flip):
