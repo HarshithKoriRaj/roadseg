@@ -69,6 +69,7 @@ from .engine import load_checkpoint, save_checkpoint, train_one_epoch
 from .eval import evaluate, predict_full, resolve_device, select_threshold
 from .losses import ComboLoss
 from .models.segmenter import build_model
+from .provenance import environment
 from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
                       EXIT_REQUEUE, PreflightFailed, Refused, RunLock, clear_stale_temps,
                       code_identity, describe_code, run_cli, same_code, tmp_name)
@@ -893,6 +894,10 @@ def main(argv=None) -> int:
         run_preflight(cfg, device, use_amp, code=code, device_name=device_name,
                       sentinel=args.runs_dir is not None)
         return EXIT_OK
+    # Provenance for metrics.json, fixed now like the code identity: library versions,
+    # CUDA/cuDNN, the pretrained file by content, the data by count (and DeepGlobe's split
+    # by fingerprint). Only the two splits training opens are listed.
+    env = environment(cfg, splits=("train", "val"))
     # Every job on a GPU tests the device before the real model exists (--preflight forces
     # it on a CPU). Other tasks' failures are looked at in _train, for a fresh run only.
     self_test = None
@@ -907,15 +912,16 @@ def main(argv=None) -> int:
         # Under the lock every temp file is the debris of a dead process: a half-written
         # checkpoint is never read, but it is 300 MB.
         clear_stale_temps(run)
-        return _train(args, cfg, run, device, build, code, device_name, self_test)
+        return _train(args, cfg, run, device, build, code, device_name, self_test, env)
     finally:
         lock.release()
 
 
 def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_name: str,
-           self_test=None) -> int:
+           self_test=None, env: dict | None = None) -> int:
     """Everything `main` does to the run directory. The caller holds the run's lock.
-    `self_test()` (the preflight, or None) runs before the real model is seeded and built."""
+    `self_test()` (the preflight, or None) runs before the real model is seeded and built.
+    `env` is the provenance block for metrics.json."""
     is_cuda = str(device).startswith("cuda")
     use_amp = bool(cfg["amp"])
     if (run / "metrics.json").exists():
@@ -1026,7 +1032,8 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
         published = finish(model=model, val_ds=val_ds, run=run, cfg=cfg, state=state,
                            device=device, use_amp=use_amp, eval_workers=cfg["eval_workers"],
                            device_name=device_name, preempt=preempt,
-                           extra={"n_params": n_params, "steps_per_epoch": steps_per_epoch,
+                           extra={"environment": env, "n_params": n_params,
+                                  "steps_per_epoch": steps_per_epoch,
                                   "n_train_images": len(train_ds.rows),
                                   "n_val_images": len(val_ds)})
         return EXIT_REQUEUE if published is None else EXIT_OK

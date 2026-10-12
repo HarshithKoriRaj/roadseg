@@ -35,6 +35,7 @@ from .engine import load_checkpoint
 from .image_metrics import image_metrics
 from .metrics import confusion, metrics_from_confusion
 from .models.segmenter import build_model
+from .provenance import environment
 from .runtime import (PreflightFailed, Refused, RunLock, clear_stale_temps, code_identity,
                       run_cli, tmp_name)
 
@@ -313,6 +314,9 @@ def _score(a, run: Path, device: str) -> int:
     cfg, threshold = meta["cfg"], float(meta["threshold"])
     if "data_root" not in cfg:
         raise KeyError("cfg has no 'data_root'; refusing to guess a cwd-relative data location")
+    # Provenance of THIS pass (the training's is in metrics.json). No pretrained file: the
+    # scorer loads best.pt and nothing else.
+    env = environment(cfg, with_pretrained=False)
     model_cfg = {**cfg, "pretrained": False}       # weights come from the checkpoint
     model = build_model(model_cfg).to(device)
     ck = load_checkpoint(run / "best.pt", model, map_location=device) or {}
@@ -363,7 +367,7 @@ def _score(a, run: Path, device: str) -> int:
               f"{meta['code_commit']}", file=sys.stderr)
     payload = {"cfg": cfg, "threshold": threshold, "split": a.split,
                "protocol": "standard" if standard else "nonstandard", "eval": ev,
-               "aggregate": agg, "per_image": rows}
+               "environment": env, "aggregate": agg, "per_image": rows}
     tmp = tmp_name(out_path)                                   # .<name>.<host>.<pid>.tmp
     with open(tmp, "x") as f:                                  # exclusive create
         json.dump(payload, f, indent=2)

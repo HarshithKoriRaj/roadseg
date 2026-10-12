@@ -28,6 +28,7 @@ from PIL import Image
 
 import roadseg.data.dataset as dsmod
 import roadseg.eval as ev
+import roadseg.provenance as pv
 import roadseg.train as tr
 from roadseg.engine import load_checkpoint
 from roadseg.stats import aggregate_runs
@@ -748,6 +749,72 @@ def test_metrics_are_frozen_before_test_scoring_and_never_rewritten(tiny):
                     "--workers", "0"]) == 0
     assert tiny.train("--resume", "auto") == 0
     assert (run / "metrics.json").read_bytes() == frozen and (run / "best.pt").read_bytes() == best
+
+
+def test_metrics_record_the_environment_of_the_run(tiny):
+    """W3. Library versions, CUDA/cuDNN, the pretrained file by content, image counts --
+    fixed at startup, in metrics.json and in every <split>_metrics.json."""
+    import platform
+    assert tiny.train() == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+    env = read(run / "metrics.json")["environment"]
+    v = env["versions"]
+    assert set(v) == {"python", "torch", "torchvision", "numpy", "scipy", "scikit-image", "opencv",
+                      "networkx", "pillow"} and all(isinstance(x, str) and x for x in v.values())
+    assert (v["python"], v["torch"], v["numpy"]) == (platform.python_version(), torch.__version__,
+                                                     np.__version__)
+    assert env["cuda"] == torch.version.cuda and "cudnn" in env and env["cudnn_benchmark"] is False
+    assert env["n_images"] == {"train": 6, "val": 2}      # training never lists the third split
+    expected = pv.pretrained_file({"model": "roadsegmenter", "pretrained": True})
+    assert env["pretrained_file"] == str(expected) and expected.name == "resnext50_32x4d-7cdf4587.pth"
+    assert env["pretrained_sha256"] == pv.file_sha256(expected)   # None where it is not cached
+    if expected.is_file():
+        assert len(env["pretrained_sha256"]) == 64
+
+    assert ev.main(["--run", str(run), "--split", "test", "--tile", "32", "--stride", "16",
+                    "--workers", "0"]) == 0
+    tenv = read(run / "test_metrics.json")["environment"]
+    assert tenv["versions"] == v and tenv["n_images"] == {"train": 6, "val": 2, "test": 3}
+    assert "pretrained_sha256" not in tenv                # the scorer loads best.pt, nothing else
+
+
+def test_provenance_of_pretrained_files_and_of_the_deepglobe_split(tmp_path):
+    assert pv.pretrained_file({"model": "unet", "pretrained": True}) is None      # loads nothing
+    assert pv.pretrained_file({"model": "roadsegmenter", "pretrained": False}) is None
+    assert pv.pretrained_file({"model": "dlinknet", "pretrained": True}).name == "resnet34-b627a593.pth"
+    f = tmp_path / "w.pth"
+    f.write_bytes(b"weights")
+    assert pv.file_sha256(f) == hashlib.sha256(b"weights").hexdigest()
+    assert pv.file_sha256(tmp_path / "absent.pth") is None
+    env = pv.environment({"model": "unet", "pretrained": True, "dataset": "massachusetts",
+                          "data_root": str(tmp_path)})
+    assert env["pretrained_file"] is None and env["pretrained_sha256"] is None
+    assert env["n_images"] == {"train": 0, "val": 0, "test": 0}
+
+    root = tmp_path / "deepglobe"                         # a synthetic DeepGlobe pool
+    (root / "train").mkdir(parents=True)
+    for i in range(40):
+        (root / "train" / f"{1000 + i}_sat.jpg").touch()
+    from roadseg.data.prepare import deepglobe_splits
+    parts = deepglobe_splits(root)
+    d = pv.dataset_provenance(root, "deepglobe", splits=("train", "val"))
+    assert d["n_images"] == {k: len(parts[k]) for k in ("train", "val", "test")} == {
+        "train": 28, "val": 6, "test": 6}
+    assert d["deepglobe_test_ids_sha256"] == hashlib.sha256(
+        "\n".join(sorted(parts["test"])).encode()).hexdigest()
+
+
+@pytest.mark.skipif(not (ROOT / "data" / "deepglobe" / "train").is_dir(),
+                    reason="DeepGlobe data not present")
+def test_real_deepglobe_split_fingerprint_is_the_pinned_one():
+    """W3. What every DeepGlobe run records equals the constant tests/test_prepare.py pins."""
+    DG_TEST_SHA256 = re.search(r'^DG_TEST_SHA256 = "([0-9a-f]{64})"$',
+                               (ROOT / "tests/test_prepare.py").read_text(), re.M).group(1)
+    d = pv.dataset_provenance(ROOT / "data" / "deepglobe", "deepglobe")
+    assert d == {"n_images": {"train": 4358, "val": 933, "test": 935},
+                 "deepglobe_test_ids_sha256": DG_TEST_SHA256}
+    cfg = tr.resolve_config(args_for(ROOT / "configs/deepglobe.yaml", "--rung", "R0"))
+    assert pv.environment(cfg, splits=("train", "val"))["deepglobe_test_ids_sha256"] == DG_TEST_SHA256
 
 
 def test_eval_saves_probability_maps_and_scores_iou_at_05_in_the_same_pass(tiny, monkeypatch):
