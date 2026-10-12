@@ -11,16 +11,67 @@ Two different estimands are reported by `aggregate_runs`:
     resampled within each arm, then images (paired). Crude with ~3 seeds
     (resampling 3 values), but it is the only interval that includes
     seed-to-seed variance.
+
+The analysis is pre-specified: `ANALYSIS_PLAN` was committed before any test-split
+result existed and is copied verbatim into every summary. One comparison is primary;
+every other number this module prints is secondary and says so.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import warnings as _warnings
 from pathlib import Path
 
 import numpy as np
+
+# Fixed before any test result was read. Do not edit after results exist: a change here is a
+# change of analysis plan and has to be reported as one.
+ANALYSIS_PLAN = {
+    "status": "pre-specified: committed before any test-split result was read or aggregated",
+    "primary": {
+        "comparison": "R1 vs R0",
+        "rung": "R1",
+        "baseline": "R0",
+        "metric": "iou",
+        "metric_definition": "per-image IoU at the validation-selected threshold",
+        "split": "test",
+        "method": "two-level bootstrap (seeds within arm, then images), percentile interval",
+        "result": "vs_baseline.R1.two_level",
+        "n_boot": 10_000,
+        "seed": 0,
+        "alpha": 0.05,
+    },
+    "secondary": ("Everything else (other rungs, baselines, other metrics, pooled IoU, IoU@0.5, "
+                  "exclusions) is SECONDARY / exploratory and is reported without multiplicity "
+                  "correction, labelled as such."),
+    "coverage_note": ("In the review's simulation, with 3 seeds per arm the two-level percentile "
+                      "interval covered 0.94-0.98 in most simulated regimes and 0.86 when seed "
+                      "variance dominated at n = 935, so it can be anti-conservative; the "
+                      "seed-paired t interval is reported beside it."),
+    "scope": ("The plan is applied to each dataset separately (one summary per dataset); nothing "
+              "is corrected for there being more than one dataset."),
+}
+
+
+def _plan_deviations(*, metric: str, split: str, baseline: str, n_boot: int, seed: int,
+                     allow_nonstandard: bool, compared: set[str]) -> list[str]:
+    """How this call differs from the pre-specified primary analysis ([] = it is that analysis).
+
+    Any deviation means NO row of the output is the primary result: a table computed with
+    another metric, split, baseline, replicate count or bootstrap seed, or one that admits
+    non-standard-protocol runs, is a different analysis from the one that was fixed in advance.
+    """
+    p = ANALYSIS_PLAN["primary"]
+    got = {"metric": metric, "split": split, "baseline": baseline, "n_boot": n_boot, "seed": seed}
+    dev = [f"{k}={v!r} (plan: {p[k]!r})" for k, v in got.items() if v != p[k]]
+    if allow_nonstandard:
+        dev.append("allow_nonstandard=True (plan: standard-protocol runs only)")
+    if p["rung"] not in compared:
+        dev.append(f"rung {p['rung']} is not among the compared rungs {sorted(compared)}")
+    return dev
 
 
 def _mc_p(means: np.ndarray) -> float:
@@ -177,6 +228,11 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
     HEADLINE: `vs_baseline[rung]["two_level"]` (training-procedure estimand, includes
     seed variance; crude with ~3 seeds). `image_level` is the specific-trained-models
     estimand (images only); `seed_level` gives per-seed means and a Welch-style SE.
+
+    `analysis_plan` is `ANALYSIS_PLAN` verbatim, whatever the arguments. `primary` says
+    whether THIS call is the pre-specified primary analysis; if it is, the plan's rung has
+    `vs_baseline[rung]["role"] == "primary"`. Every other comparison, and every comparison
+    of a call that departs from the plan, has role "secondary" (exploratory, uncorrected).
     """
     warns: list[str] = []
     runs = _find_runs(Path(runs_dir), dataset, split, allow_nonstandard, warns)
@@ -243,8 +299,19 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
                     "image_level": image_level, "two_level": two_level,
                     "seed_level": {"rung": rs, "baseline": bs,
                                    "mean_diff": float(np.mean(rs) - np.mean(bs)), "se": se}}
+    plan = ANALYSIS_PLAN["primary"]
+    deviations = _plan_deviations(metric=metric, split=split, baseline=baseline, n_boot=n_boot,
+                                  seed=seed, allow_nonstandard=allow_nonstandard, compared=set(vs))
+    if deviations:
+        warns.append("no row here is the pre-specified primary analysis (" + plan["comparison"]
+                     + "): " + "; ".join(deviations) + "; every comparison is secondary")
+    for rung, v in vs.items():
+        v["role"] = "primary" if rung == plan["rung"] and not deviations else "secondary"
     return {"dataset": dataset, "split": split, "metric": metric, "baseline": baseline,
-            "headline": "two_level", "rungs": rungs, "vs_baseline": vs, "warnings": warns}
+            "headline": "two_level", "analysis_plan": copy.deepcopy(ANALYSIS_PLAN),
+            "primary": {"comparison": plan["comparison"], "result": plan["result"],
+                        "conforms_to_plan": not deviations, "deviations": deviations},
+            "rungs": rungs, "vs_baseline": vs, "warnings": warns}
 
 
 def _fmt(x) -> str:
@@ -268,7 +335,16 @@ def main(argv=None) -> int:
 
     pk, mk = f"dataset_{a.metric}", f"mean_{a.metric}"
     pm = lambda m: f"{_fmt(m.get('mean'))}+-{_fmt(m.get('std')).strip()}"
+    plan = out["analysis_plan"]
     print(f"{a.dataset} / {a.split}: headline = two-level bootstrap vs {a.baseline} on {a.metric}")
+    if out["primary"]["conforms_to_plan"]:
+        print(f"PRIMARY (pre-specified): {plan['primary']['comparison']}, "
+              f"{plan['primary']['metric_definition']}, {plan['primary']['method']}")
+    else:
+        print(f"NO PRIMARY ROW: this call is not the pre-specified analysis "
+              f"({'; '.join(out['primary']['deviations'])})")
+    print(plan["secondary"])
+    print(plan["coverage_note"])
     print(f"{'rung':5} {'seeds':>5} {'pooled':>15} {'per-image':>15} {'diff':>8} "
           f"{'95% CI':>18} {'p':>7} {'n_img':>6}")
     for rung, r in out["rungs"].items():
@@ -278,9 +354,10 @@ def main(argv=None) -> int:
         if v:
             t = v["two_level"]
             line += (f" {t['mean_diff']:+8.4f} [{t['ci_low']:+.4f},{t['ci_high']:+.4f}] "
-                     f"{t['p_value']:7.4f} {v['n_images']:6d}")
+                     f"{t['p_value']:7.4f} {v['n_images']:6d}  "
+                     + ("PRIMARY" if v["role"] == "primary" else "(secondary)"))
         else:
-            line += f" {'':8} {'':18} {'':7} {r['n_images']:6d}"
+            line += f" {'':8} {'':18} {'':7} {r['n_images']:6d}  (baseline)"
         print(line)
     for w in out["warnings"]:
         print(f"WARNING: {w}")

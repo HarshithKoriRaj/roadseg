@@ -1,8 +1,10 @@
+import copy
 import json
 
 import numpy as np
 import pytest
 
+from roadseg import stats
 from roadseg.stats import aggregate_runs, main as stats_main, paired_bootstrap, two_level_bootstrap
 
 
@@ -248,3 +250,94 @@ def test_stats_cli_writes_summary(runs, capsys):
     assert summary["vs_baseline"]["R1"]["image_level"]["mean_diff"] == pytest.approx(0.05)
     assert summary["headline"] == "two_level"
     assert "R1" in capsys.readouterr().out
+
+
+# ------------------------------------------------- S1: the pre-specified analysis plan
+
+def test_analysis_plan_states_the_primary_comparison_verbatim(runs):
+    plan = aggregate_runs(runs, "massachusetts")["analysis_plan"]
+    assert plan == stats.ANALYSIS_PLAN and json.loads(json.dumps(plan)) == plan
+    p = plan["primary"]
+    assert (p["rung"], p["baseline"], p["metric"], p["split"]) == ("R1", "R0", "iou", "test")
+    assert (p["n_boot"], p["seed"], p["alpha"]) == (10_000, 0, 0.05)
+    assert p["result"] == "vs_baseline.R1.two_level"
+    assert "validation-selected threshold" in p["metric_definition"]
+    assert "seeds within arm, then images" in p["method"]
+    sec = plan["secondary"]
+    assert "SECONDARY / exploratory" in sec and "without multiplicity correction" in sec
+    for what in ("other rungs", "baselines", "other metrics", "pooled IoU", "IoU@0.5", "exclusions"):
+        assert what in sec
+    note = plan["coverage_note"]
+    for what in ("3 seeds per arm", "0.94", "0.98", "0.86", "n = 935", "anti-conservative",
+                 "seed-paired t interval"):
+        assert what in note
+
+
+def test_analysis_plan_is_the_same_whatever_the_call_asks_for(runs):
+    """A plan that followed the arguments would not be a plan."""
+    frozen = copy.deepcopy(stats.ANALYSIS_PLAN)
+    out = aggregate_runs(runs, "massachusetts", baseline="R2", n_boot=200, seed=3)
+    assert out["analysis_plan"] == frozen
+    out["analysis_plan"]["primary"]["rung"] = "R2"          # the caller's copy, not the constant
+    assert stats.ANALYSIS_PLAN == frozen
+
+
+def test_primary_row_is_r1_and_every_other_row_is_secondary(runs):
+    out = aggregate_runs(runs, "massachusetts")
+    assert out["primary"] == {"comparison": "R1 vs R0", "result": "vs_baseline.R1.two_level",
+                              "conforms_to_plan": True, "deviations": []}
+    assert out["vs_baseline"]["R1"]["role"] == "primary"
+    assert out["vs_baseline"]["R2"]["role"] == "secondary"
+    assert not any("pre-specified" in w for w in out["warnings"])
+
+
+@pytest.mark.parametrize("kwargs, said", [({"n_boot": 500}, "n_boot=500"), ({"seed": 1}, "seed=1"),
+                                           ({"baseline": "R2"}, "baseline='R2'"),
+                                           ({"allow_nonstandard": True}, "allow_nonstandard")])
+def test_a_call_that_departs_from_the_plan_has_no_primary_row(runs, kwargs, said):
+    out = aggregate_runs(runs, "massachusetts", **kwargs)
+    assert out["primary"]["conforms_to_plan"] is False
+    assert any(said in d for d in out["primary"]["deviations"])
+    assert {v["role"] for v in out["vs_baseline"].values()} == {"secondary"}
+    assert any("pre-specified" in w and said in w for w in out["warnings"])
+
+
+def test_other_metric_or_split_or_missing_r1_is_not_primary(tmp_path):
+    no_r1, val = tmp_path / "no_r1", tmp_path / "val"
+    for s in (0, 1):
+        _write_run(no_r1, "R0", s, BASE, 0.6)
+        _write_run(no_r1, "R2", s, BASE, 0.6)
+        _write_run(val, "R0", s, BASE, 0.6, split="val")
+        _write_run(val, "R1", s, BASE, 0.6, split="val")
+    out = aggregate_runs(no_r1, "massachusetts")
+    assert any("R1" in d for d in out["primary"]["deviations"]) and not out["primary"]["conforms_to_plan"]
+    out = aggregate_runs(val, "massachusetts", split="val")
+    assert any("split='val'" in d for d in out["primary"]["deviations"])
+    assert out["vs_baseline"]["R1"]["role"] == "secondary"
+    out = aggregate_runs(val, "massachusetts", split="val", metric="n_gt")
+    assert any("metric='n_gt'" in d for d in out["primary"]["deviations"])
+
+
+def _table(capsys, runs, *extra):
+    assert stats_main(["--runs-dir", str(runs), "--dataset", "massachusetts", *extra]) == 0
+    return capsys.readouterr()
+
+
+def _row_of(text, rung):
+    rows = [ln for ln in text.splitlines() if ln.split()[:1] == [rung]]
+    assert len(rows) == 1, f"the table has one line per rung; {rung}: {rows}"
+    return rows[0]
+
+
+def test_table_marks_the_primary_row_and_labels_the_rest_secondary(runs, capsys):
+    out = _table(capsys, runs).out
+    assert _row_of(out, "R1").rstrip().endswith("PRIMARY")
+    assert _row_of(out, "R2").rstrip().endswith("(secondary)")
+    assert "PRIMARY" not in _row_of(out, "R0") and "(secondary)" not in _row_of(out, "R0")
+    assert "without multiplicity correction" in out and "anti-conservative" in out
+
+
+def test_table_has_no_primary_row_when_the_call_departs_from_the_plan(runs, capsys):
+    out = _table(capsys, runs, "--allow-nonstandard").out
+    assert _row_of(out, "R1").rstrip().endswith("(secondary)")
+    assert not any(ln.rstrip().endswith("PRIMARY") for ln in out.splitlines())
