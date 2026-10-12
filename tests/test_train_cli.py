@@ -1074,7 +1074,13 @@ def test_sbatch_directives():
     smoke = _directives(ROOT / "scripts/sbatch_smoke_cpu.sh")
     assert (smoke["--partition"], smoke["--cpus-per-task"], smoke["--mem"], smoke["--time"]) == (
         "cpu_short", "16", "64G", "03:00:00")
-    for script in ("sbatch_train_array.sh", "sbatch_aggregate.sh", "sbatch_smoke_cpu.sh"):
+    canary = _directives(ROOT / "scripts/sbatch_canary.sh")              # G6
+    assert (canary["--partition"], canary["--gres"], canary["--cpus-per-task"], canary["--mem"],
+            canary["--time"]) == ("l40s_public,h200_public", "gpu:1", "8", "48G", "00:40:00")
+    assert "--requeue" not in canary and "--array" not in canary and "--qos" not in canary
+    assert canary["--account"] == "torch_pr_627_general"
+    for script in ("sbatch_train_array.sh", "sbatch_aggregate.sh", "sbatch_smoke_cpu.sh",
+                   "sbatch_canary.sh", "launch.sh"):
         r = subprocess.run(["bash", "-n", str(ROOT / "scripts" / script)], capture_output=True,
                            text=True)
         assert r.returncode == 0, r.stderr
@@ -1307,6 +1313,137 @@ def test_a_checkpoint_without_a_code_identity_is_not_resumed_silently(tiny, monk
     assert tiny.train("--resume", "auto", "--allow-code-change") == 0
     m = read(latest.parent / "metrics.json")
     assert m["code_changes"][0]["from"] is None and len(m["processes"]) == 1
+
+
+# ----------------------------------------------------------------------------- G6: preflight
+
+def _count_builds(monkeypatch, fail_first=None):
+    """Stub build_model that records each call's cfg; the model of the FIRST call (the
+    preflight's throwaway) can be made to fail in forward with `fail_first`."""
+    builds = []
+
+    class Failing(Tiny):
+        def forward(self, x):
+            raise fail_first
+
+    def build(cfg):
+        builds.append(dict(cfg))
+        torch.randn(13)                         # construction draws from the global RNG
+        return Failing() if fail_first is not None and len(builds) == 1 else Tiny()
+
+    monkeypatch.setattr(tr, "build_model", build)
+    return builds
+
+
+def _result(run):
+    m = read(run / "metrics.json")
+    return (weights_digest(run / "best.pt"), weights_digest(run / "latest.pt"), m["threshold"],
+            [(r["epoch"], r["train_loss"], r["val_iou"], r["lr"]) for r in m["history"]],
+            json.dumps(m["val"], sort_keys=True))
+
+
+def test_preflight_runs_first_on_a_throwaway_model_and_does_not_change_the_run(tiny, monkeypatch,
+                                                                              capsys):
+    """G6. Same final weights, history and scores with and without the preflight: the real
+    model is seeded and built after it, and the crop stream does not depend on it."""
+    run = tiny.runs / "massachusetts_R1_s0"
+    builds = _count_builds(monkeypatch)
+    assert tiny.train("--preflight") == 0                         # forced: this is a CPU
+    out = capsys.readouterr().out
+    assert out.index("preflight ok:") < out.index("steps/epoch")  # before the real model exists
+    assert "name=R1 batch=2 tile=32 amp=False" in out and "steps_per_s=" in out and "peak_gb=" in out
+    assert len(builds) == 2 and builds[0]["pretrained"] is False  # the throwaway loads no weights
+    with_preflight = _result(run)
+
+    shutil.rmtree(tiny.runs)
+    builds.clear()
+    assert tiny.train() == 0                                      # CPU default: no preflight
+    assert "preflight ok" not in capsys.readouterr().out and len(builds) == 1
+    assert _result(run) == with_preflight
+
+    shutil.rmtree(tiny.runs)
+    builds.clear()
+    assert tiny.train("--preflight", "--skip-preflight") == 0     # --skip-preflight wins
+    assert "preflight ok" not in capsys.readouterr().out and len(builds) == 1
+
+
+def test_preflight_exercises_the_real_step_and_the_real_loss(tiny, monkeypatch):
+    """2 optimizer steps at the configured batch and tile through engine.train_one_epoch
+    (autocast + gradient guard) with the run's loss -- clDice for R3 -- then one eval-mode
+    batch of 8 tiles through predict_full."""
+    seen = {"loss": [], "forward": [], "steps": []}
+    real_loss, real_train = tr.ComboLoss, tr.train_one_epoch
+
+    class Loss(real_loss):
+        def __init__(self, use_cldice=False, **k):
+            seen["loss"].append(use_cldice)
+            super().__init__(use_cldice=use_cldice, **k)
+
+    class Probe(Tiny):
+        def forward(self, x):
+            seen["forward"].append((tuple(x.shape), self.training))
+            return super().forward(x)
+
+    def train_one_epoch(*a, **k):
+        seen["steps"].append(k.get("max_batches"))
+        return real_train(*a, **k)
+
+    monkeypatch.setattr(tr, "ComboLoss", Loss)
+    monkeypatch.setattr(tr, "build_model", lambda cfg: Probe())
+    monkeypatch.setattr(tr, "train_one_epoch", train_one_epoch)
+    cfg = tr.resolve_config(args_for(tiny.cfg(batch_size=3), "--rung", "R3"))
+    res = tr.preflight(cfg, "cpu", use_amp=False)
+    assert seen["loss"] == [True] and seen["steps"] == [2]
+    assert seen["forward"] == [((3, 3, 32, 32), True), ((3, 3, 32, 32), True),
+                               ((8, 3, 32, 32), False)]
+    assert res["steps_per_s"] > 0 and res["batch"] == 3 and res["tile"] == 32 and res["name"] == "R3"
+    seen["loss"].clear()
+    tr.preflight(tr.resolve_config(args_for(tiny.cfg(), "--rung", "R2")), "cpu", use_amp=False)
+    tr.preflight(tr.resolve_config(args_for(tiny.cfg(), "--model", "unet")), "cpu", use_amp=False)
+    assert seen["loss"] == [False, False]
+
+
+def test_a_failed_preflight_leaves_a_sentinel_that_stops_every_other_run(tiny, monkeypatch, capsys):
+    """G6. One failing task must stop the other 35 from burning queue time: exit code 3
+    (never requeued), and a PREFLIGHT_FAILED.* file that makes every later start exit 3."""
+    builds = _count_builds(monkeypatch, fail_first=RuntimeError("CUDA out of memory (simulated)"))
+    sentinel = tiny.runs / "PREFLIGHT_FAILED.massachusetts_R1_s0.txt"
+    with pytest.raises(tr.PreflightFailed, match="PREFLIGHT_FAILED.massachusetts_R1_s0.txt"):
+        tiny.train("--preflight")
+    text = sentinel.read_text()
+    assert "CUDA out of memory (simulated)" in text and "Traceback" in text
+    assert socket.gethostname() in text and tr.code_identity()["commit"] in text
+    assert "device: cpu" in text and "run: massachusetts_R1_s0" in text
+    run = tiny.runs / "massachusetts_R1_s0"
+    assert len(builds) == 1 and not (run / "latest.pt").exists()  # the real model never existed
+
+    for flags in ((), ("--preflight",), ("--resume", "auto")):    # any other task, CPU or GPU
+        with pytest.raises(tr.PreflightFailed, match="PREFLIGHT_FAILED.massachusetts_R1_s0.txt"):
+            tiny.train(*flags, name=("--rung", "R2"))
+    assert len(builds) == 1                                       # ... stops before building
+    assert not (tiny.runs / "massachusetts_R2_s0").exists()
+    assert tiny.train("--dry-run", name=("--rung", "R2")) == 0    # (a dry run is not a run)
+
+    assert tiny.train("--skip-preflight", name=("--rung", "R2")) == 0   # disables both
+    sentinel.unlink()                                             # the operator's all-clear
+    assert tiny.train("--preflight") == 0
+
+
+def test_preflight_only_tests_and_exits(tiny, monkeypatch, capsys):
+    builds = _count_builds(monkeypatch)
+    assert tiny.train("--preflight-only") == 0
+    assert "preflight ok: name=R1" in capsys.readouterr().out and len(builds) == 1
+    assert not (tiny.runs / "massachusetts_R1_s0").exists()       # no run was started
+
+    builds = _count_builds(monkeypatch, fail_first=FloatingPointError("non-finite loss nan"))
+    with pytest.raises(tr.PreflightFailed, match="PREFLIGHT_FAILED.massachusetts_R3_s0.txt"):
+        tiny.train("--preflight-only", name=("--rung", "R3"))
+    assert "non-finite loss nan" in (tiny.runs / "PREFLIGHT_FAILED.massachusetts_R3_s0.txt").read_text()
+    builds = _count_builds(monkeypatch)                           # the canary tests them ALL:
+    assert tiny.train("--preflight-only", name=("--rung", "R0")) == 0   # an earlier failure
+    assert len(builds) == 1                                             # does not skip the next
+    with pytest.raises(SystemExit):                               # argparse: contradictory
+        tiny.train("--preflight-only", "--skip-preflight")
 
 
 # ----------------------------------------------------------------------------- G5: launch.sh
@@ -2170,6 +2307,37 @@ def test_real_data_end_to_end(tmp_path):
     assert t["threshold"] == m["threshold"]
     r = _cli("roadseg.eval", *score)
     assert r.returncode == 2 and "already exists" in r.stderr
+
+
+@pytest.mark.slow
+@needs_data
+@needs_ram
+def test_the_canary_script_rehearsed_on_cpu(tmp_path):
+    """G6. scripts/sbatch_canary.sh will run for the first time on a GPU after a day in the
+    queue; rehearse the script itself here -- real ResNeXt, real data, tiny sizes, on CPU:
+    the preflight table, two miniature runs with test scoring, and the kill-and-resume drill."""
+    runs = tmp_path / "runs_canary"
+    env = dict(ENV, OMP_NUM_THREADS="4", MKL_NUM_THREADS="4", CANARY_THREADS="4",
+               ROADSEG_RUNS_CANARY=str(runs), CANARY_DEVICE="cpu", CANARY_NAMES="R3 unet",
+               CANARY_TRAIN_EXTRA="--preflight --no-amp --tile 128 --batch-size 2",
+               CANARY_MINI="--epochs 1 --max-train-batches 3 --limit-train 4 --limit-val 1 --workers 2",
+               CANARY_EVAL_EXTRA="--tile 128 --stride 64 --workers 2", CANARY_DRILL_STEPS="2")
+    env.pop("ROADSEG_CODE", None)
+    r = subprocess.run(["bash", str(ROOT / "scripts/sbatch_canary.sh")], capture_output=True,
+                       text=True, env=env, timeout=3000)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out[-6000:]
+    assert out.rstrip().splitlines()[-1].startswith("CANARY: ALL PASSED"), out[-2000:]
+    table = out[out.index("preflight table"):].splitlines()[1:4]
+    assert table[0].split() == ["name", "steps/s", "peak", "GB"]
+    assert [row.split()[0] for row in table[1:]] == ["R3", "unet"]
+    assert all(float(row.split()[1]) > 0 for row in table[1:])              # steps/s parsed
+    assert out.count("preflight ok:") == 2 + 2 + 2            # table, 2 mini runs, drill x2
+    assert "exit 75" not in out and "preempted: checkpoint saved at epoch" in out
+    assert "final state ok: 2 history rows" in out and "2 processes, 1 resume" in out
+    for name in ("R1", "R3"):
+        assert (runs / f"massachusetts_{name}_s0" / "test_metrics.json").exists()
+    assert not list(runs.glob("PREFLIGHT_FAILED.*"))
 
 
 @pytest.mark.slow

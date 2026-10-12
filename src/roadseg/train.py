@@ -54,6 +54,7 @@ import random
 import signal
 import socket
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -64,7 +65,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .data.dataset import RoadFullDataset, RoadTileDataset
 from .engine import load_checkpoint, save_checkpoint, train_one_epoch
-from .eval import evaluate, resolve_device, select_threshold
+from .eval import evaluate, predict_full, resolve_device, select_threshold
 from .losses import ComboLoss
 from .models.segmenter import build_model
 from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
@@ -127,6 +128,13 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-preload", action="store_true")
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--no-pretrained", action="store_true")
+    ap.add_argument("--preflight", action="store_true",
+                    help="run the device self-test before the run even on a CPU (on CUDA it "
+                         "always runs: 2 optimizer steps + 1 eval batch on a throwaway model)")
+    ap.add_argument("--skip-preflight", action="store_true",
+                    help="no self-test, and ignore PREFLIGHT_FAILED.* files in the runs dir")
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="run the self-test for this configuration and exit (0, or 3)")
     ap.add_argument("--allow-code-change", action="store_true",
                     help="resume although the code differs from the code that wrote the "
                          "checkpoint (both identities are recorded in metrics.json)")
@@ -632,12 +640,119 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
     return published
 
 
+# --------------------------------------------------------------------------- preflight
+
+PREFLIGHT_STEPS = 2          # optimizer steps at the configured batch size and tile
+PREFLIGHT_EVAL_BATCH = 8     # tiles in the one eval-mode forward (predict_full's batch)
+SENTINEL = "PREFLIGHT_FAILED."
+
+
+def preflight(cfg: dict, device: str, use_amp: bool) -> dict:
+    """Self-test of exactly what this run will ask of the device, on a THROWAWAY model.
+
+    A throwaway instance of the run's architecture takes PREFLIGHT_STEPS real optimizer
+    steps (engine.train_one_epoch: bf16 autocast, the run's loss -- clDice for R3 --, the
+    gradient guard, AdamW) at the configured batch size and tile on random tensors, then
+    one eval-mode forward of PREFLIGHT_EVAL_BATCH tiles through predict_full. Anything
+    that would kill the job at step 0 -- out of memory at this batch size, an operator
+    without a bf16 kernel, a non-finite loss -- raises here, in the first minute.
+
+    It cannot change the run: the random tensors come from private generators, the
+    throwaway model loads no pretrained weights and is freed, and the real model is seeded
+    (set_seed) and built only afterwards. Returns {name, batch, tile, amp, steps_per_s,
+    peak_gb, seconds}; peak_gb is torch.cuda.max_memory_allocated (0 on a CPU).
+    """
+    is_cuda = str(device).startswith("cuda")
+    b, t = int(cfg["batch_size"]), int(cfg["tile"])
+    g = torch.Generator().manual_seed(0)
+    t0 = time.monotonic()
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    model = build_model({**cfg, "pretrained": False}).to(device)
+    loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                                  weight_decay=cfg["weight_decay"])
+    batches = [{"image": torch.randn(b, 3, t, t, generator=g),
+                "mask": (torch.rand(b, 1, t, t, generator=g) > 0.9).float(),
+                "valid": torch.ones(b, 1, t, t)} for _ in range(PREFLIGHT_STEPS)]
+    stamps = [time.monotonic()]
+
+    def on_step(i: int, loss: float) -> None:
+        if is_cuda:
+            torch.cuda.synchronize()
+        stamps.append(time.monotonic())
+
+    train_one_epoch(model, batches, loss_fn, optimizer, use_amp, device,
+                    max_batches=PREFLIGHT_STEPS, on_step=on_step)
+    if len(stamps) != PREFLIGHT_STEPS + 1:
+        raise RuntimeError(f"preflight took {len(stamps) - 1} steps, expected {PREFLIGHT_STEPS}")
+    # 2 x 4 tiles with stride == tile: exactly one batch of 8 through the inference path
+    image = np.random.default_rng(0).standard_normal((2 * t, 4 * t, 3)).astype(np.float32)
+    prob = predict_full(model, image, tile=t, stride=t, device=device,
+                        batch=PREFLIGHT_EVAL_BATCH, use_amp=use_amp)
+    if prob.shape != (2 * t, 4 * t) or not np.isfinite(prob).all():
+        raise FloatingPointError(f"preflight inference gave shape {prob.shape}, "
+                                 f"finite={bool(np.isfinite(prob).all())}")
+    result = {"name": cfg["name"], "batch": b, "tile": t, "amp": bool(use_amp),
+              # the first step pays for cuDNN autotuning and allocation; rate the last one
+              "steps_per_s": 1.0 / max(stamps[-1] - stamps[-2], 1e-9),
+              "peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if is_cuda else 0.0,
+              "seconds": time.monotonic() - t0}
+    del model, loss_fn, optimizer, batches, prob, image
+    if is_cuda:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    return result
+
+
+def run_preflight(cfg: dict, device: str, use_amp: bool, *, code: dict, device_name: str,
+                  log=print) -> dict:
+    """`preflight`, reported. On ANY failure: write <runs_dir>/PREFLIGHT_FAILED.<run>.txt
+    (which makes every other task of the launch stop at startup -- see check_sentinels)
+    and raise PreflightFailed (exit code 3, never requeued)."""
+    try:
+        r = preflight(cfg, device, use_amp)
+    except Exception as exc:
+        name = run_name(cfg)
+        sentinel = Path(cfg["runs_dir"]) / f"{SENTINEL}{name}.txt"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(
+            f"run: {name}\nhost: {socket.gethostname()}\ndevice: {device} ({device_name})\n"
+            f"commit: {describe_code(code)}\ntime: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+            f"job: {os.environ.get('SLURM_JOB_ID', '-')}\n"
+            f"batch_size: {cfg['batch_size']}  tile: {cfg['tile']}  amp: {use_amp}\n\n"
+            f"{traceback.format_exc()}\n"
+            f"While this file exists every `roadseg.train` in {sentinel.parent} exits 3 at "
+            f"startup. Fix the cause, delete the file, and launch again.\n")
+        raise PreflightFailed(
+            f"{type(exc).__name__}: {exc} -- the self-test of {name} on {device_name} failed "
+            f"before the run started; details in {sentinel}") from exc
+    log(f"preflight ok: name={r['name']} batch={r['batch']} tile={r['tile']} amp={r['amp']} "
+        f"steps_per_s={r['steps_per_s']:.2f} peak_gb={r['peak_gb']:.2f} "
+        f"eval_batch={PREFLIGHT_EVAL_BATCH} seconds={r['seconds']:.1f} device={device_name}",
+        flush=True)
+    return r
+
+
+def check_sentinels(runs_dir) -> None:
+    """Exit 3 if any task's preflight has failed in this runs directory: the other tasks
+    of the launch would fail the same way, each after its own day in the queue."""
+    found = sorted(Path(runs_dir).glob(f"{SENTINEL}*")) if Path(runs_dir).is_dir() else []
+    if found:
+        raise PreflightFailed(
+            f"{found[0]} exists" + (f" (and {len(found) - 1} more)" if len(found) > 1 else "")
+            + ": a preflight failed in this runs directory, so no run starts here. Read it, "
+              "fix the cause, delete it, launch again (--skip-preflight overrides).")
+
+
 # --------------------------------------------------------------------------- entrypoint
 
 def main(argv=None) -> int:
     ap = _parser()
     args = ap.parse_args(argv)
     cfg = resolve_config(args, error=ap.error)
+    if args.preflight_only and args.skip_preflight:
+        ap.error("--preflight-only and --skip-preflight contradict each other")
     run = Path(cfg["runs_dir"]) / run_name(cfg)
     device = resolve_device(args.device)       # an explicit cuda never falls back to the CPU
     use_amp = bool(cfg["amp"])
@@ -672,6 +787,21 @@ def main(argv=None) -> int:
               f"warmup_epochs={cfg['warmup_epochs']} epochs={cfg['epochs']}", flush=True)
         return EXIT_OK
 
+    is_cuda = str(device).startswith("cuda")
+    if is_cuda:
+        torch.backends.cudnn.benchmark = True      # before the preflight: same conv algorithms
+    if args.preflight_only:                        # the canary: test this configuration, exit
+        run_preflight(cfg, device, use_amp, code=code, device_name=device_name)
+        return EXIT_OK
+    # Every job on a GPU tests the device before the real model exists (--preflight forces
+    # it on a CPU). A failure anywhere stops every task that starts afterwards.
+    self_test = None
+    if not args.skip_preflight:
+        check_sentinels(cfg["runs_dir"])
+        if is_cuda or args.preflight:
+            def self_test():
+                run_preflight(cfg, device, use_amp, code=code, device_name=device_name)
+
     # One writer per run directory, from before any state is read until the process ends
     # (the kernel drops the lock on any exit, SIGKILL included). Refused -> exit code 2.
     lock = RunLock(run).acquire()
@@ -679,13 +809,15 @@ def main(argv=None) -> int:
         # Under the lock every temp file is the debris of a dead process: a half-written
         # checkpoint is never read, but it is 300 MB.
         clear_stale_temps(run)
-        return _train(args, cfg, run, device, build, code, device_name)
+        return _train(args, cfg, run, device, build, code, device_name, self_test)
     finally:
         lock.release()
 
 
-def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_name: str) -> int:
-    """Everything `main` does to the run directory. The caller holds the run's lock."""
+def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_name: str,
+           self_test=None) -> int:
+    """Everything `main` does to the run directory. The caller holds the run's lock.
+    `self_test()` (the preflight, or None) runs before the real model is seeded and built."""
     is_cuda = str(device).startswith("cuda")
     use_amp = bool(cfg["amp"])
     if (run / "metrics.json").exists():
@@ -722,14 +854,14 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
             steps_per_epoch = min(steps_per_epoch, cfg["max_train_batches"])
         if steps_per_epoch < 1:
             raise Refused(f"no full batch: {len(train_ds)} crops per epoch, "
-                             f"batch_size {cfg['batch_size']}")
+                          f"batch_size {cfg['batch_size']}")
 
-        model, loss_fn, optimizer = build()
+        if self_test is not None:
+            self_test()                        # raises PreflightFailed (exit 3) with a sentinel
+        model, loss_fn, optimizer = build()    # seeded HERE, after the throwaway model is gone
         n_params = sum(p.numel() for p in model.parameters())
         scheduler = build_scheduler(optimizer, round(cfg["warmup_epochs"] * steps_per_epoch),
                                     cfg["epochs"] * steps_per_epoch)
-        if is_cuda:
-            torch.backends.cudnn.benchmark = True
 
         if resume is not None:
             state = load_state(resume, model, optimizer, scheduler, cfg, steps_per_epoch,
