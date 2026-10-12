@@ -9,3 +9,4 @@ _probe.txt
 *.pt
 *.pth
 .superpowers/
+runs_smoke/

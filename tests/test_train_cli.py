@@ -7,6 +7,7 @@ be killed at every single durable operation. The two `slow` tests run the real
 CLI on the real data with a real ResNeXt.
 """
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -291,6 +292,33 @@ def test_crop_stream_depends_only_on_seed_and_position(tmp_path):
 def test_crop_stream_is_the_same_with_worker_processes(tmp_path):
     root = fake_mass(tmp_path / "d")
     assert _stream(root, 0, 1, workers=2) == _stream(root, 0, 1, workers=0)
+
+
+def test_crop_stream_with_persistent_workers_over_several_epochs(tmp_path):
+    """The production loader shape: persistent workers, the sampler re-aimed before each
+    pass, and each pass consumed with islice exactly as train_one_epoch does (so the
+    iterator is never run to StopIteration). Includes a pass resumed at step 1."""
+    root = fake_mass(tmp_path / "d")
+
+    def run(workers):
+        base = dsmod.RoadTileDataset(root, "massachusetts", "train", tile=32)
+        tokens = tr.EpochTokens(3, 2)
+        loader = torch.utils.data.DataLoader(
+            tr.SeededCrops(base, 0), batch_size=2, sampler=tokens, drop_last=True,
+            num_workers=workers, persistent_workers=workers > 0,
+            worker_init_fn=tr._worker_init if workers else None,
+            generator=torch.Generator().manual_seed(0))
+        out = []
+        for epoch, start in ((0, 0), (1, 0), (2, 1), (3, 0)):
+            tokens.set(epoch, start)
+            out.append([digest(torch.cat([b["image"].flatten(), b["mask"].flatten()]))
+                        for b in itertools.islice(loader, 3 - start)])
+        return out
+
+    single = run(0)
+    assert [len(e) for e in single] == [3, 3, 2, 3]
+    assert len({d for e in single for d in e}) == 11
+    assert run(2) == single
 
 
 def test_seeded_crops_leaves_the_global_rng_alone(tmp_path):
@@ -703,10 +731,16 @@ def test_refuses_to_mix_runs_in_one_directory(tiny, capsys):
         tiny.train(cfg=tiny.cfg(epochs=2))                         # no --resume: would clobber it
     with pytest.raises(SystemExit, match="no such checkpoint"):
         tiny.train("--resume", str(tiny.root / "nope.pt"), cfg=tiny.cfg(epochs=2))
+    # what a SIGKILL in the middle of publishing metrics.json leaves behind
+    (run / ".metrics.json.4242.tmp").write_text('{"cfg": {"trunc')
+    (run / ".history.json.tmp").write_text("[{")
+    (run / "latest.tmp").write_bytes(b"torn")
     assert tiny.train("--resume", "auto", cfg=tiny.cfg(epochs=2)) == 0   # straight to the finish
     out = capsys.readouterr().out
     assert "resumed from" in out and "at epoch 2 step 0" in out
     assert read(run / "metrics.json")["resumes"] == 1
+    assert sorted(p.name for p in run.iterdir()) == ["best.pt", "history.json", "latest.pt",
+                                                     "metrics.json"]      # debris cleared
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR1])
@@ -1272,6 +1306,85 @@ def test_real_data_pipeline_with_a_stub_model(tmp_path, monkeypatch, capsys):
     assert t["protocol"] == "nonstandard" and len(t["per_image"]) == 1
     assert t["per_image"][0]["id"] != row["id"]                     # a test image, not the val one
     assert ev.main(score) == 2
+
+
+BOOT = '''"""The real `python -m roadseg.train` in a real process, with the 4-channel stub model."""
+import runpy, sys, time
+import torch.nn as nn
+import roadseg.models.segmenter as seg
+
+DELAY = float(sys.argv[1])
+
+
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.BatchNorm2d(4), nn.ReLU(),
+                                 nn.Conv2d(4, 1, 1))
+
+    def forward(self, x):
+        if self.training:
+            time.sleep(DELAY)                   # stretch an optimizer step so it can be hit
+        return self.net(x)
+
+
+seg.build_model = lambda cfg: Tiny()
+sys.argv = sys.argv[2:]
+runpy.run_module(sys.argv[0], run_name="__main__", alter_sys=True)
+'''
+
+
+@pytest.mark.slow
+def test_a_real_sigkill_mid_epoch_then_resume_matches_the_uninterrupted_run(tmp_path):
+    """The crash sweep above simulates the kill with an exception. This is the real thing:
+    SIGKILL (no handler, no cleanup) to a real training process in the middle of an epoch."""
+    boot = tmp_path / "boot.py"
+    boot.write_text(BOOT)
+    cfg = write_cfg(tmp_path, fake_mass(tmp_path / "data"), epochs=2, max_train_batches=6,
+                    ckpt_minutes=0)
+    env = dict(ENV, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+
+    def cmd(delay, runs):
+        return [sys.executable, str(boot), str(delay), "roadseg.train", "--config", str(cfg),
+                "--rung", "R1", "--device", "cpu", "--runs-dir", str(tmp_path / runs),
+                "--resume", "auto"]
+
+    def result(runs):
+        run = tmp_path / runs / "massachusetts_R1_s0"
+        m = read(run / "metrics.json")
+        return (weights_digest(run / "best.pt"), weights_digest(run / "latest.pt"),
+                [(r["epoch"], r["val_iou"], r["lr"]) for r in m["history"]], m["threshold"],
+                json.dumps(m["val"], sort_keys=True))
+
+    r = subprocess.run(cmd(0, "ref"), capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert read(tmp_path / "ref/massachusetts_R1_s0/metrics.json")["resumes"] == 0
+
+    run = tmp_path / "killed" / "massachusetts_R1_s0"
+    p = subprocess.Popen(cmd(0.5, "killed"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=env, cwd=ROOT)
+    t0 = time.time()
+    while not (run / "latest.pt").exists():                 # written after the first step
+        assert p.poll() is None, p.communicate()
+        assert time.time() - t0 < 600
+        time.sleep(0.05)
+    time.sleep(0.7)                                         # somewhere inside step 2 or 3
+    p.kill()
+    p.communicate()
+    assert p.returncode == -signal.SIGKILL
+    assert_nothing_partial_is_visible(run)
+    extra = torch.load(run / "latest.pt", map_location="cpu", weights_only=False)["extra"]
+    assert extra["epoch"] == 0 and 0 < extra["step_in_epoch"] < 6
+    assert not (run / "metrics.json").exists() and not (run / "history.json").exists()
+
+    r = subprocess.run(cmd(0, "killed"), capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"at epoch 0 step {extra['step_in_epoch']}" in r.stdout
+    m = read(run / "metrics.json")
+    assert m["resumes"] == 1 and m["history"][0]["resumed"] is True
+    assert m["history"][0]["train_steps"] == 6 - extra["step_in_epoch"]
+    assert result("killed") == result("ref")                # bitwise the same model and scores
+    assert_nothing_partial_is_visible(run)
 
 
 @pytest.mark.slow

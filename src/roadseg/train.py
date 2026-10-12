@@ -629,6 +629,8 @@ def main(argv=None) -> int:
             torch.backends.cudnn.benchmark = True
 
         run.mkdir(parents=True, exist_ok=True)
+        for torn in run.glob("*.tmp"):         # half-written checkpoint of a killed process;
+            torn.unlink(missing_ok=True)       # never read, but 300 MB each
         if resume is not None:
             state = load_state(resume, model, optimizer, scheduler, cfg, steps_per_epoch,
                                map_location=device)
