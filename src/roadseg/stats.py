@@ -28,6 +28,11 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import t as _student_t
 
+# Sensitivity to near-empty images: images whose ground truth has fewer than this many road
+# pixels on valid pixels are excluded (0 excludes none). Fixed here, not tuned.
+N_GT_FLOORS = (0, 1, 500, 2000)
+TOP_K = 5                                # images listed by |contribution| to the mean difference
+
 # Fixed before any test result was read. Do not edit after results exist: a change here is a
 # change of analysis plan and has to be reported as one.
 ANALYSIS_PLAN = {
@@ -54,6 +59,15 @@ ANALYSIS_PLAN = {
                       "seed-paired t interval is reported beside it."),
     "scope": ("The plan is applied to each dataset separately (one summary per dataset); nothing "
               "is corrected for there being more than one dataset."),
+    "sensitivity": {
+        "n_gt_floors": list(N_GT_FLOORS),
+        "top_k_images": TOP_K,
+        "note": ("Secondary. The comparison is repeated excluding images whose ground truth has "
+                 "fewer than n_gt_floor road pixels on valid pixels (0 excludes none), and on "
+                 "iou_at_0.5, which does not depend on the validation-selected threshold; the "
+                 "top_k_images images with the largest absolute contribution to the mean "
+                 "difference are listed. The floors are fixed here, not tuned."),
+    },
 }
 
 
@@ -322,6 +336,102 @@ def _paired_t_block(R, B, r_seeds, b_seeds) -> tuple[dict | None, list[str]]:
     return res, notes
 
 
+def _compare(R, B, r_seeds, b_seeds, n_boot: int, seed: int) -> dict:
+    """The headline pair on another slice of the data: two-level bootstrap and seed-paired t.
+
+    `two_level` is None, with the reason in `note`, when fewer than 2 images have a finite
+    value in both arms; `seed_paired_t` is None below 2 usable common seeds.
+    """
+    out = {}
+    try:
+        out["two_level"] = two_level_bootstrap(R, B, n_boot=n_boot, seed=seed)
+    except ValueError as e:
+        out["two_level"], out["note"] = None, str(e)
+    out["seed_paired_t"] = _paired_t_block(R, B, r_seeds, b_seeds)[0]
+    return out
+
+
+def n_gt_floor_sensitivity(R, B, n_gt, r_seeds, b_seeds, full: dict | None = None,
+                           n_boot: int = 10_000, seed: int = 0) -> list[dict]:
+    """The comparison again, without the images whose ground truth is nearly empty.
+
+    For each floor in `N_GT_FLOORS`, images with `n_gt` (ground-truth road pixels on valid
+    pixels) below the floor are excluded and the two-level bootstrap and the seed-paired t
+    are recomputed on the rest. Estimand at floor f: the same difference between training
+    procedures, restricted to the sub-population of images with n_gt >= f. It is a different
+    population, not a correction: per-image IoU on an image with a handful of road pixels is
+    close to a coin flip between 0 and 1 (and an image with none scores 1.0 or 0.0 on
+    whether a single false-positive pixel survives), so the question answered is how much of
+    the headline rests on such images. Floor 0 excludes nothing and is the headline itself;
+    a floor that excludes nothing reuses `full` (same data, same seed, same numbers).
+
+    `n_excluded` / `n_kept` count images before the bootstrap drops non-finite ones;
+    `two_level["n_images"]` is what it actually used.
+    """
+    out = []
+    for floor in N_GT_FLOORS:
+        keep = np.asarray(n_gt) >= floor
+        entry = {"n_gt_floor": floor, "n_excluded": int((~keep).sum()), "n_kept": int(keep.sum())}
+        if keep.all() and full is not None:
+            entry.update({k: copy.deepcopy(full[k]) for k in ("two_level", "seed_paired_t")})
+        else:
+            entry.update(_compare(R[:, keep], B[:, keep], r_seeds, b_seeds, n_boot, seed))
+        out.append(entry)
+    return out
+
+
+def top_images(ids, R, B, n_gt=None, k: int = TOP_K) -> dict:
+    """The k images that contribute most, in absolute value, to the mean per-image difference.
+
+    d_i = mean_s R[s, i] - mean_s B[s, i] (NaN-aware over seeds). The point estimate of the
+    image-level and two-level analyses is mean_i d_i over the n images with a finite d_i, so
+    image i contributes d_i / n to it. Descriptive, not inferential: it says where the
+    difference comes from, e.g. one near-empty image flipping between IoU 0 and 1.
+
+    Per image: id, n_gt (None if unknown), each arm's seed-mean value, d_i, and d_i / n.
+    `share_of_mean_diff` = sum of the k d_i / sum of all d_i: signed, exceeds 1 or goes
+    negative when the remaining images pull the other way, None when the total is zero to
+    rounding (a share of nothing). `share_of_abs_diff` = sum of the k |d_i| / sum of all
+    |d_i|, always in [0, 1], None when every d_i is zero. Ties in |d_i| are broken by id.
+    """
+    R, B = np.asarray(R, float), np.asarray(B, float)
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", RuntimeWarning)             # all-NaN image
+        rm, bm = np.nanmean(R, axis=0), np.nanmean(B, axis=0)
+    d = rm - bm
+    ok = np.flatnonzero(np.isfinite(d))
+    n = len(ok)
+    total, abs_total = float(d[ok].sum()), float(np.abs(d[ok]).sum())
+    top = sorted(ok.tolist(), key=lambda j: (-abs(d[j]), str(ids[j])))[:k]
+
+    def gt(j):
+        if n_gt is None:
+            return None
+        v = float(n_gt[j])
+        return int(v) if v.is_integer() else v
+
+    return {"k": int(k), "n_images": n, "mean_diff": total / n if n else None,
+            "share_of_mean_diff": (float(d[top].sum()) / total
+                                   if abs(total) > 1e-12 * abs_total else None),
+            "share_of_abs_diff": float(np.abs(d[top]).sum()) / abs_total if abs_total > 0 else None,
+            "images": [{"id": ids[j], "n_gt": gt(j), "rung": float(rm[j]), "baseline": float(bm[j]),
+                        "diff": float(d[j]), "contribution": float(d[j]) / n} for j in top]}
+
+
+def _common_n_gt(arms: list[list[dict]], ids: list) -> tuple[np.ndarray | None, str | None]:
+    """n_gt per image if every run of both arms reports it and they agree -> (array, None);
+    otherwise (None, why). n_gt is a property of the image (ground truth on valid pixels),
+    not of the model: runs that disagree did not score the same ground truth."""
+    g = _field([rows for per_seed in arms for rows in per_seed], ids, "n_gt")
+    if g is None:
+        return None, "per-image field(s) n_gt absent from at least one run"
+    bad = np.flatnonzero((g != g[0]).any(axis=0))
+    if len(bad):
+        return None, (f"n_gt differs between runs for {len(bad)} image(s) (first: {ids[bad[0]]!r}); "
+                      "the runs did not score the same ground truth")
+    return g[0], None
+
+
 def _load(path: Path) -> dict:
     try:
         return json.loads(path.read_text())
@@ -439,6 +549,14 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
     common image ids averaged over seeds, with its own two-level bootstrap; see
     `pooled_iou_bootstrap`. It is always about IoU, whatever `metric` is.
 
+    Sensitivity to near-empty images (all secondary): `n_gt_floors` repeats the comparison
+    on `metric` excluding images below each floor of `N_GT_FLOORS` (see
+    `n_gt_floor_sensitivity`); `top_images` lists the `TOP_K` images that contribute most to
+    the mean difference and their share of it (see `top_images`); `iou_at_0.5` is the
+    two-level bootstrap and seed-paired t on the per-image field `iou_at_0.5`, IoU at the
+    fixed 0.5 threshold, which the validation-selected threshold cannot influence, and
+    `pooled_iou_at_0.5` the pooled-IoU difference from `tp_0.5`/`fp_0.5`/`fn_0.5`.
+
     An analysis whose per-image fields are missing from some run (older result files) is
     None, is named with its reason in `vs_baseline[rung]["skipped"]`, and gets one line in
     `warnings`; it is never a crash and never a silent omission.
@@ -525,12 +643,28 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
             except ValueError as e:
                 raise ValueError(f"{rung} vs {baseline}, {analysis}: {e}") from e
 
+        r_seeds = rungs[rung]["seeds"]
+        n_gt, why = _common_n_gt(arms, common)
+        if n_gt is None:
+            floors, skipped["n_gt_floors"] = None, why
+        else:
+            floors = n_gt_floor_sensitivity(R, Bm, n_gt, r_seeds, base_seeds, n_boot=n_boot, seed=seed,
+                                            full={"two_level": two_level, "seed_paired_t": paired_t})
+        fixed = [_field(a, common, "iou_at_0.5") for a in arms]
+        if any(f is None for f in fixed):
+            at_05 = None
+            skipped["iou_at_0.5"] = "per-image field(s) iou_at_0.5 absent from at least one run"
+        else:
+            at_05 = _compare(*fixed, r_seeds, base_seeds, n_boot, seed)
+
         vs[rung] = {"n_images": len(common), "n_missing_ids": n_missing,
                     "n_dropped_nan": image_level["n_dropped"],
                     "image_level": image_level, "two_level": two_level,
                     "seed_level": {"rung": rs, "baseline": bs,
                                    "mean_diff": float(np.mean(rs) - np.mean(bs)), "se": se},
                     "seed_paired_t": paired_t, "pooled_iou": pooled("pooled_iou"),
+                    "n_gt_floors": floors, "top_images": top_images(common, R, Bm, n_gt),
+                    "iou_at_0.5": at_05, "pooled_iou_at_0.5": pooled("pooled_iou_at_0.5", "_0.5"),
                     "skipped": skipped}
         for analysis, why in skipped.items():
             skips.setdefault((analysis, why), []).append(rung)

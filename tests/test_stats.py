@@ -630,7 +630,8 @@ def test_pooled_and_per_image_iou_answer_different_questions(tmp_path):
     assert small["pooled_iou"]["mean_diff"] < 0.001 < 0.3 < small["two_level"]["ci_low"]
     assert out["rungs"]["big"]["metrics"]["dataset_iou"]["mean"] - out["rungs"]["R0"]["metrics"][
         "dataset_iou"]["mean"] == pytest.approx(big["pooled_iou"]["mean_diff"])
-    assert "pooled_iou" not in big["skipped"] and not any("pooled_iou" in w for w in out["warnings"])
+    assert "pooled_iou" not in big["skipped"]
+    assert not any(w.startswith("pooled_iou skipped") for w in out["warnings"])
     assert aggregate_runs(tmp_path, "massachusetts", n_boot=2000) == out
 
 
@@ -649,7 +650,7 @@ def test_pooled_iou_is_skipped_with_one_warning_when_counts_are_missing(runs):
     for rung in ("R1", "R2"):
         v = out["vs_baseline"][rung]
         assert v["pooled_iou"] is None and "tp, fp, fn" in v["skipped"]["pooled_iou"]
-    w = [w for w in out["warnings"] if "pooled_iou" in w]
+    w = [w for w in out["warnings"] if w.startswith("pooled_iou skipped")]
     assert len(w) == 1 and "R1, R2" in w[0] and "tp, fp, fn" in w[0]
     assert "warning" not in out["rungs"]["R2"]                 # a skip is not a per-rung data problem
 
@@ -675,3 +676,172 @@ def test_pooled_iou_bootstrap_speed_at_the_real_size():
                                    _arm((union * rng.random((3, 935))).astype(int), union))
     dt = time.time() - t
     assert r["n_boot"] == 10_000 and r["n_images"] == 935 and dt < 20, dt
+
+
+# ------------------------------------------------ S4: sensitivity to near-empty images
+
+LARGE = [f"large{i}" for i in range(6)]
+MEDIUM = [f"medium{i}" for i in range(4)]
+
+
+def _flip_runs(root, at05=True, drop=(), drop_in=None):
+    """Twelve images. `tiny` has 3 road pixels: R0 misses them in every seed (IoU 0), R1 finds
+    all three in seeds 0 and 1 (IoU 1) and none in seed 2 (IoU 0). `empty` has no road and
+    nobody predicts any (IoU 1 for both). On the six 5000-pixel images R1 is better by 0.02;
+    on the four 600-pixel ones the arms are equal. At the fixed 0.5 threshold both arms find
+    the three pixels, so the flip is gone there.
+
+    Per-image diffs: tiny 2/3, large 0.02 x 6, the rest 0  ->  mean (2/3 + 0.12) / 12."""
+    for rung, gain in (("R0", 0), ("R1", 100)):
+        for s in (0, 1, 2):
+            found = 3 if rung == "R1" and s < 2 else 0
+            rows = [_row("tiny", found, 0, 3 - found, at05=(3, 0, 0) if at05 else None),
+                    _row("empty", 0, 0, 0, at05=(0, 0, 0) if at05 else None)]
+            for i in MEDIUM:
+                rows.append(_row(i, 300, 0, 300, at05=(300, 0, 300) if at05 else None))
+            for i in LARGE:
+                c = (2500 + gain, 0, 2500 - gain)
+                rows.append(_row(i, *c, at05=c if at05 else None))
+            where = drop_in is None or (rung, s) in drop_in
+            _write_rows(root, rung, s, rows, drop=drop if where else ())
+
+
+FLIP_DIFF = (2 / 3 + 6 * 0.02) / 12
+
+
+def test_plan_fixes_the_floors_and_the_number_of_images_listed():
+    assert stats.ANALYSIS_PLAN["sensitivity"]["n_gt_floors"] == [0, 1, 500, 2000] == list(stats.N_GT_FLOORS)
+    assert stats.ANALYSIS_PLAN["sensitivity"]["top_k_images"] == 5 == stats.TOP_K
+
+
+def test_n_gt_floors_remove_the_near_empty_image_that_carries_the_difference(tmp_path):
+    _flip_runs(tmp_path)
+    v = aggregate_runs(tmp_path, "massachusetts", n_boot=2000)["vs_baseline"]["R1"]
+    assert v["two_level"]["mean_diff"] == pytest.approx(FLIP_DIFF)             # 0.0656
+    floors = v["n_gt_floors"]
+    assert [f["n_gt_floor"] for f in floors] == [0, 1, 500, 2000]
+    assert [f["n_excluded"] for f in floors] == [0, 1, 2, 6]
+    assert [f["n_kept"] for f in floors] == [12, 11, 10, 6]
+    want = [FLIP_DIFF, (2 / 3 + 0.12) / 11, 0.12 / 10, 0.12 / 6]
+    assert [f["two_level"]["mean_diff"] for f in floors] == pytest.approx(want)
+    assert [f["seed_paired_t"]["mean_diff"] for f in floors] == pytest.approx(want)
+    assert floors[0]["two_level"] == v["two_level"]                            # floor 0 = nothing excluded
+    # with the 3-pixel image in, the interval is as wide as that one image makes it ...
+    assert floors[0]["two_level"]["ci_high"] > 0.15 and floors[1]["two_level"]["ci_high"] > 0.15
+    # ... without it, what is left is the +0.02 on the large images and nothing else
+    assert 0 < floors[2]["two_level"]["ci_low"] and floors[2]["two_level"]["ci_high"] <= 0.02 + 1e-9
+    assert floors[3]["two_level"]["ci_low"] == pytest.approx(0.02) == floors[3]["two_level"]["ci_high"]
+    assert [f["two_level"]["n_images"] for f in floors] == [12, 11, 10, 6]
+    # seed 2 did not find the 3 pixels: d_s = (1 + .12)/12 twice, then .12/12
+    assert floors[0]["seed_paired_t"]["d"] == pytest.approx([1.12 / 12, 1.12 / 12, 0.12 / 12])
+
+
+def test_top_images_name_the_near_empty_image_and_its_share(tmp_path):
+    _flip_runs(tmp_path)
+    top = aggregate_runs(tmp_path, "massachusetts", n_boot=200)["vs_baseline"]["R1"]["top_images"]
+    assert top["k"] == 5 and top["n_images"] == 12 and len(top["images"]) == 5
+    assert top["mean_diff"] == pytest.approx(FLIP_DIFF)
+    first = top["images"][0]
+    assert first["id"] == "tiny" and first["n_gt"] == 3
+    assert first["rung"] == pytest.approx(2 / 3) and first["baseline"] == 0.0
+    assert first["diff"] == pytest.approx(2 / 3) and first["contribution"] == pytest.approx(2 / 3 / 12)
+    # the other four are large images at +0.02 each: equal |contribution|, so in id order
+    assert [i["id"] for i in top["images"][1:]] == LARGE[:4]
+    assert all(i["n_gt"] == 5000 and i["diff"] == pytest.approx(0.02) for i in top["images"][1:])
+    share = (2 / 3 + 4 * 0.02) / (2 / 3 + 6 * 0.02)                             # 0.949
+    assert top["share_of_mean_diff"] == pytest.approx(share)
+    assert top["share_of_abs_diff"] == pytest.approx(share)
+    assert first["contribution"] / top["mean_diff"] == pytest.approx(0.8475, abs=1e-4)
+
+
+def test_top_images_shares_when_differences_cancel():
+    ids = ["a", "b", "c", "d", "e", "f", "g"]
+    R = np.array([[0.25, 0.75, 0.5, 0.5, 0.5, 0.5, 0.625]])
+    B = np.full((1, 7), 0.5)                                    # d = -.25 +.25 0 0 0 0 +.125
+    top = stats.top_images(ids, R, B, k=2)
+    assert [i["id"] for i in top["images"]] == ["a", "b"]         # |d| tie -> id order
+    assert [i["diff"] for i in top["images"]] == [-0.25, 0.25]
+    assert top["share_of_mean_diff"] == 0.0                       # they cancel: 0 of the 0.125
+    assert top["share_of_abs_diff"] == pytest.approx(0.5 / 0.625)
+    assert top["images"][0]["n_gt"] is None
+    top = stats.top_images(ids[:2], R[:, :2], B[:, :2])           # total difference is zero
+    assert top["mean_diff"] == pytest.approx(0.0, abs=1e-12) and top["share_of_mean_diff"] is None
+    assert top["share_of_abs_diff"] == 1.0 and len(top["images"]) == 2          # fewer than k images
+    same = stats.top_images(ids, B, B)
+    assert same["share_of_mean_diff"] is None and same["share_of_abs_diff"] is None
+    json.dumps([top, same], allow_nan=False)
+
+
+def test_top_images_ignore_images_without_a_finite_difference():
+    R = np.array([[0.9, np.nan, 0.5], [0.7, np.nan, 0.5]])
+    B = np.array([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]])
+    top = stats.top_images(["a", "dead", "c"], R, B, n_gt=np.array([10, 0, 20]))
+    assert top["n_images"] == 2 and [i["id"] for i in top["images"]] == ["a", "c"]
+    assert top["images"][0] == {"id": "a", "n_gt": 10, "rung": pytest.approx(0.8), "baseline": 0.5,
+                                "diff": pytest.approx(0.3), "contribution": pytest.approx(0.15)}
+
+
+def test_iou_at_fixed_threshold_does_not_show_the_flip(tmp_path):
+    """The same comparison on iou_at_0.5, which no validation-selected threshold touches."""
+    _flip_runs(tmp_path)
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=2000)
+    v = out["vs_baseline"]["R1"]
+    assert v["iou_at_0.5"]["two_level"]["mean_diff"] == pytest.approx(0.12 / 12)
+    assert v["iou_at_0.5"]["two_level"]["ci_high"] <= 0.02 + 1e-9
+    assert v["iou_at_0.5"]["seed_paired_t"]["d"] == pytest.approx([0.01] * 3)
+    assert v["pooled_iou_at_0.5"]["mean_diff"] == pytest.approx(600 / 32403)
+    # at the selected threshold R1 also has the 3 pixels of `tiny` in two seeds of three
+    assert v["pooled_iou"]["rung"]["per_seed"] == pytest.approx([16803 / 32403, 16803 / 32403, 16800 / 32403])
+    assert v["pooled_iou"]["mean_diff"] == pytest.approx(602 / 32403)
+    assert v["skipped"] == {} and not any("skipped" in w for w in out["warnings"])
+
+
+def test_rows_without_the_fixed_threshold_fields_skip_only_those_analyses(tmp_path):
+    _flip_runs(tmp_path, at05=False)                             # result files from before the field
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    v = out["vs_baseline"]["R1"]
+    assert v["iou_at_0.5"] is None and v["pooled_iou_at_0.5"] is None
+    assert set(v["skipped"]) == {"iou_at_0.5", "pooled_iou_at_0.5"}
+    assert "iou_at_0.5" in v["skipped"]["iou_at_0.5"] and "tp_0.5, fp_0.5, fn_0.5" in v["skipped"]["pooled_iou_at_0.5"]
+    assert len([w for w in out["warnings"] if w.startswith("iou_at_0.5 skipped for R1:")]) == 1
+    assert len([w for w in out["warnings"] if w.startswith("pooled_iou_at_0.5 skipped for R1:")]) == 1
+    assert v["pooled_iou"] is not None and len(v["n_gt_floors"]) == 4 and v["top_images"]["images"]
+
+
+def test_one_run_without_the_fixed_threshold_fields_is_enough_to_skip(tmp_path):
+    _flip_runs(tmp_path, drop=("iou_at_0.5", "fn_0.5"), drop_in={("R0", 1)})
+    v = aggregate_runs(tmp_path, "massachusetts", n_boot=200)["vs_baseline"]["R1"]
+    assert v["iou_at_0.5"] is None and v["pooled_iou_at_0.5"] is None
+    assert "fn_0.5" in v["skipped"]["pooled_iou_at_0.5"] and "tp_0.5" not in v["skipped"]["pooled_iou_at_0.5"]
+
+
+def test_rows_without_n_gt_skip_the_floors_and_list_images_without_it(tmp_path):
+    _flip_runs(tmp_path, drop=("n_gt",))
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    v = out["vs_baseline"]["R1"]
+    assert v["n_gt_floors"] is None and "n_gt" in v["skipped"]["n_gt_floors"]
+    assert [w for w in out["warnings"] if w.startswith("n_gt_floors skipped for R1:")]
+    assert v["top_images"]["images"][0]["id"] == "tiny" and v["top_images"]["images"][0]["n_gt"] is None
+    assert out["rungs"]["R1"]["n_empty_gt"] is None
+
+
+def test_runs_that_disagree_on_n_gt_skip_the_floors(tmp_path):
+    """n_gt is a property of the image; if two runs report different values they did not score
+    the same ground truth, and a floor on it means nothing."""
+    _flip_runs(tmp_path)
+    f = tmp_path / "massachusetts_R1_s2" / "test_metrics.json"
+    res = json.loads(f.read_text()); res["per_image"][0]["n_gt"] = 4; f.write_text(json.dumps(res))
+    out = aggregate_runs(tmp_path, "massachusetts", n_boot=200)
+    v = out["vs_baseline"]["R1"]
+    assert v["n_gt_floors"] is None and "differs between runs" in v["skipped"]["n_gt_floors"]
+    assert "tiny" in v["skipped"]["n_gt_floors"] and v["top_images"]["images"][0]["n_gt"] is None
+
+
+def test_a_floor_that_leaves_fewer_than_two_images_reports_none(runs):
+    """Every image of the `runs` fixture has n_gt = 100."""
+    v = aggregate_runs(runs, "massachusetts", n_boot=200)["vs_baseline"]["R1"]
+    lo, mid, hi = v["n_gt_floors"][1], v["n_gt_floors"][2], v["n_gt_floors"][3]
+    assert lo["n_excluded"] == 0 and lo["two_level"] == v["two_level"]
+    for f in (mid, hi):
+        assert f["n_excluded"] == 6 and f["n_kept"] == 0
+        assert f["two_level"] is None and f["seed_paired_t"] is None and "at least 2" in f["note"]
