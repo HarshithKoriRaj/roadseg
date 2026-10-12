@@ -29,8 +29,8 @@ from .engine import load_checkpoint
 from .image_metrics import image_metrics
 from .metrics import confusion, metrics_from_confusion
 from .models.segmenter import build_model
-from .runtime import (PreflightFailed, RunLock, clear_stale_temps, code_identity, run_cli,
-                      tmp_name)
+from .runtime import (PreflightFailed, Refused, RunLock, clear_stale_temps, code_identity,
+                      run_cli, tmp_name)
 
 _COUNTS = ("tp", "fp", "fn", "tn")
 _ROW_NONMETRIC = ("id", "n_valid", "tp", "fp", "fn", "n_gt", "n_pred")
@@ -263,6 +263,13 @@ def _score(a, run: Path, device: str) -> int:
     model_cfg = {**cfg, "pretrained": False}       # weights come from the checkpoint
     model = build_model(model_cfg).to(device)
     ck = load_checkpoint(run / "best.pt", model, map_location=device) or {}
+    # The threshold and the model selection were frozen on metrics.json's best_epoch. Any
+    # other checkpoint under the name best.pt is not the validation-selected model.
+    if "best_epoch" in meta and ck.get("epoch") != meta["best_epoch"]:
+        raise Refused(f"{run / 'best.pt'} holds epoch {ck.get('epoch')}, but "
+                      f"{run / 'metrics.json'} froze the threshold and the selection on "
+                      f"best_epoch {meta['best_epoch']}: not the validation-selected "
+                      f"checkpoint. Not scoring the {a.split} split with it.")
     dataset = RoadFullDataset(cfg["data_root"], cfg["dataset"], a.split)
     if a.limit is not None:
         dataset = _Limited(dataset, a.limit)

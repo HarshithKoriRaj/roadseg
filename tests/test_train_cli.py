@@ -725,6 +725,27 @@ def test_metrics_are_frozen_before_test_scoring_and_never_rewritten(tiny):
     assert (run / "metrics.json").read_bytes() == frozen and (run / "best.pt").read_bytes() == best
 
 
+def test_eval_refuses_a_checkpoint_that_is_not_the_validation_selected_one(tiny):
+    """H6. Threshold and model selection were frozen on best_epoch; a best.pt from any other
+    epoch (a copied file, a half-repaired directory) must not be scored on the test split."""
+    assert tiny.train() == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+    best_epoch = read(run / "metrics.json")["best_epoch"]
+    good = (run / "best.pt").read_bytes()
+    ck = torch.load(run / "best.pt", map_location="cpu", weights_only=False)
+    ck["epoch"] = best_epoch + 1
+    torch.save(ck, run / "best.pt")
+    small = ["--tile", "32", "--stride", "16", "--workers", "0"]
+    before = sorted(p.name for p in run.iterdir())
+    for split in ("test", "val"):
+        with pytest.raises(tr.Refused, match=f"best.pt holds epoch {best_epoch + 1}.*"
+                                             f"best_epoch {best_epoch}"):
+            ev.main(["--run", str(run), "--split", split, *small])
+    assert sorted(p.name for p in run.iterdir()) == before          # nothing written
+    (run / "best.pt").write_bytes(good)
+    assert ev.main(["--run", str(run), "--split", "test", *small]) == 0
+
+
 def test_refuses_to_mix_runs_in_one_directory(tiny, capsys):
     assert tiny.train(cfg=tiny.cfg(epochs=2)) == 0
     with pytest.raises(SystemExit, match="different configuration.*epochs: 2 -> 3"):
