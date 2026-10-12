@@ -1097,6 +1097,7 @@ if s.get("block"):                      # a long step that honours SIGTERM the w
     while not got and time.time() - t0 < 60:
         time.sleep(0.02)
     note(mod + (" got SIGTERM" if got else " timed out"))
+    time.sleep(s.get("linger", 0))      # still checkpointing when the next signal arrives
     sys.exit(s.get("rc_on_term", 75) if got else 99)
 sys.exit(s.get("rc", 0))
 '''
@@ -1130,7 +1131,9 @@ def _wrapper(tmp_path, spec, task=4, signal_step=None, signum=signal.SIGUSR1, en
             assert p.poll() is None and time.time() - t0 < 60, "step never started"
             time.sleep(0.02)
         ready.unlink()
-        p.send_signal(signum)                          # to the batch shell only, like --signal=B:
+        for s in (signum if isinstance(signum, tuple) else (signum,)):
+            p.send_signal(s)                           # to the batch shell only, like --signal=B:
+            time.sleep(0.2)
     out, _ = p.communicate(timeout=120)
     lines = log.read_text().splitlines() if log.exists() else []
     return p.returncode, lines, out
@@ -1151,19 +1154,49 @@ def test_wrapper_runs_train_then_scores_the_test_split(tmp_path):
     assert log[1].startswith(f"eval argv -m roadseg.eval --run {tmp_path / 'runs'}/deepglobe_dlinknet_s0 ")
 
 
+def _requeues(log):
+    return [line for line in log if line.startswith("scontrol")]
+
+
 def test_wrapper_forwards_usr1_to_python_and_requeues_on_75(tmp_path):
     """Requirement 5: bash defers traps while a foreground child runs, so the step runs in
-    the background under `wait`; USR1 to the shell must reach python as SIGTERM."""
+    the background under `wait`; USR1 to the shell must reach python as SIGTERM. USR1 is the
+    time-limit warning (--signal=B:USR1@180): the ONLY signal that leads to a requeue."""
     rc, log, out = _wrapper(tmp_path, {"train": {"block": True}}, signal_step="train")
     assert rc == 0, out
-    assert log[1:] == ["train got SIGTERM", "scontrol requeue 777_4"], out   # and no eval
-    rc, log, out = _wrapper(tmp_path, {"train": {"block": True}}, signal_step="train",
-                            signum=signal.SIGTERM)
-    assert rc == 0 and log[1:] == ["train got SIGTERM", "scontrol requeue 777_4"], out
+    assert log[1:] == ["train got SIGTERM", "scontrol requeue 777_4"], out   # once, and no eval
     # outside an array: fall back to the plain job id
     rc, log, out = _wrapper(tmp_path, {"train": {"block": True}}, signal_step="train",
                             env_extra={"SLURM_ARRAY_JOB_ID": ""})
-    assert rc == 0 and log[-1] == "scontrol requeue 781", out
+    assert rc == 0 and log[-1] == "scontrol requeue 781" and len(_requeues(log)) == 1, out
+
+
+@pytest.mark.parametrize("spec, step", [
+    ({"train": {"block": True}}, "train"),                        # checkpoints, exits 75
+    ({"train": {"block": True, "handle": False}}, "train"),       # dies of the signal (143)
+    ({"train": {"block": True, "rc_on_term": 0}}, "train"),       # finishes in the grace period
+    ({"eval": {"block": True, "rc_on_term": 143}}, "eval"),       # scoring interrupted
+])
+def test_wrapper_never_requeues_on_term(tmp_path, spec, step):
+    """G4. TERM is `scancel` or a real preemption. The signal is forwarded so python can
+    checkpoint, but the wrapper must NOT requeue: that would undo the user's scancel, and
+    SLURM requeues a preempted --requeue job itself."""
+    rc, log, out = _wrapper(tmp_path, spec, signal_step=step, signum=signal.SIGTERM)
+    assert _requeues(log) == [], out
+    assert rc != 0, out                                  # not "completed": it was terminated
+    assert "not requeueing" in out
+    if spec[step].get("handle", True):
+        assert log[-1] == f"{step} got SIGTERM", out     # forwarded; python had its chance
+    if step == "train":
+        assert not any(line.startswith("eval") for line in log), out     # and no scoring
+
+
+def test_wrapper_term_after_usr1_still_does_not_requeue(tmp_path):
+    """A scancel that lands after the time-limit warning wins."""
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True, "linger": 1.0}},
+                            signal_step="train", signum=(signal.SIGUSR1, signal.SIGTERM))
+    assert _requeues(log) == [] and rc != 0 and "not requeueing" in out, out
+    assert log[-1] == "train got SIGTERM", out
 
 
 def test_wrapper_requeues_when_python_dies_of_the_signal_before_its_handlers_exist(tmp_path):
@@ -1173,6 +1206,8 @@ def test_wrapper_requeues_when_python_dies_of_the_signal_before_its_handlers_exi
 
 
 def test_wrapper_requeues_instead_of_scoring_when_signalled_as_training_finishes(tmp_path):
+    """USR1 leaves 180 s: not enough to score. Training is complete on disk; the requeued
+    task finds it 'already complete' and goes straight to scoring."""
     rc, log, out = _wrapper(tmp_path, {"train": {"block": True, "rc_on_term": 0}},
                             signal_step="train")
     assert rc == 0 and log[1:] == ["train got SIGTERM", "scontrol requeue 777_4"], out
@@ -1184,20 +1219,34 @@ def test_wrapper_requeues_when_test_scoring_is_interrupted(tmp_path):
     assert rc == 0 and log[2:] == ["eval got SIGTERM", "scontrol requeue 777_4"], out
 
 
+@pytest.mark.parametrize("code", [1, 2, 3])
+def test_wrapper_never_requeues_a_failure_even_at_the_time_limit(tmp_path, code):
+    """Crash (1), refusal (2), preflight (3): they would fail again. Also when the failure
+    coincides with the time-limit warning."""
+    rc, log, out = _wrapper(tmp_path, {"train": {"rc": code}})
+    assert rc == code and len(log) == 1, out                         # no scoring, no requeue
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True, "rc_on_term": code}},
+                            signal_step="train")
+    assert rc == code and _requeues(log) == [], out
+    if code != 2:                                    # eval's 2 is the once-only refusal, below
+        rc, log, out = _wrapper(tmp_path, {"eval": {"rc": code}})
+        assert rc == code and _requeues(log) == [], out
+        rc, log, out = _wrapper(tmp_path, {"eval": {"block": True, "rc_on_term": code}},
+                                signal_step="eval")
+        assert rc == code and _requeues(log) == [], out
+
+
 def test_wrapper_exit_codes(tmp_path):
-    rc, log, out = _wrapper(tmp_path, {"train": {"rc": 3}})
-    assert rc == 3 and len(log) == 1, out                           # failed training: no scoring
-    rc, log, out = _wrapper(tmp_path, {"train": {"rc": 75}})        # preempted without our trap
-    assert rc == 0 and log[-1] == "scontrol requeue 777_4", out
+    rc, log, out = _wrapper(tmp_path, {"train": {"rc": 75}})        # 75 with no USR1 seen here:
+    assert rc == 75 and _requeues(log) == [] and len(log) == 1, out  # not ours to requeue
     rc, log, out = _wrapper(tmp_path, {"eval": {"rc": 2, "touch": "test_metrics.json"}})
     assert rc == 0 and "already scored" in out, out                 # the once-only refusal
     (tmp_path / "runs" / "massachusetts_R1_s1" / "test_metrics.json").unlink()
     rc, log, out = _wrapper(tmp_path, {"eval": {"rc": 2}})
     assert rc == 2, out                              # exit 2 WITHOUT a result is a real failure
-    rc, log, out = _wrapper(tmp_path, {"eval": {"rc": 1}})
-    assert rc == 1, out
-    rc, log, out = _wrapper(tmp_path, {"train": {"rc": 75}}, env_extra={"FAKE_SCONTROL_RC": "1"})
-    assert rc != 0, out                              # could not requeue: do not report success
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True}}, signal_step="train",
+                            env_extra={"FAKE_SCONTROL_RC": "1"})
+    assert rc != 0 and len(_requeues(log)) == 1, out  # could not requeue: do not report success
 
 
 def test_wrapper_clears_stale_scoring_temp_files(tmp_path):
