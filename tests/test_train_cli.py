@@ -758,7 +758,7 @@ def test_a_real_signal_checkpoints_exits_75_and_resumes(tiny, monkeypatch, capsy
             return super().forward(*a)
 
     monkeypatch.setattr(tr, "ComboLoss", Loss)
-    assert tiny.train() == tr.EX_TEMPFAIL == 75
+    assert tiny.train() == tr.EXIT_REQUEUE == 75
     assert "preempted: checkpoint saved at epoch 1 step 2" in capsys.readouterr().out
     assert {s: signal.getsignal(s) for s in before} == before        # handlers put back
     run = tiny.runs / "massachusetts_R1_s0"
@@ -1385,6 +1385,196 @@ def test_a_real_sigkill_mid_epoch_then_resume_matches_the_uninterrupted_run(tmp_
     assert m["history"][0]["train_steps"] == 6 - extra["step_in_epoch"]
     assert result("killed") == result("ref")                # bitwise the same model and scores
     assert_nothing_partial_is_visible(run)
+
+
+# ----------------------------------------------------------------------------- G1: every exit ends
+
+FAULT_BOOT = '''"""The real `python -m roadseg.train` in a real process, stub model, one injected event."""
+import multiprocessing, os, runpy, signal, sys
+import torch.nn as nn
+import roadseg.eval as ev
+import roadseg.losses as losses
+import roadseg.models.segmenter as seg
+
+FAULT, MARK = sys.argv[1], sys.argv[2]
+
+
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.BatchNorm2d(4), nn.ReLU(),
+                                 nn.Conv2d(4, 1, 1))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def mark():
+    """Leave the pids of the worker processes alive at the moment of the event."""
+    with open(MARK, "w") as f:
+        f.write(" ".join(str(p.pid) for p in multiprocessing.active_children()))
+
+
+real_forward, calls = losses.ComboLoss.forward, []
+
+
+def forward(self, *a):
+    calls.append(1)
+    if len(calls) == 2:                                   # optimizer step 1 of epoch 0
+        if FAULT == "loss":
+            mark()
+            raise RuntimeError("injected: the loss failed at step 1")
+        if FAULT == "sigterm":                            # job-wide, as SLURM delivers it
+            mark()
+            os.killpg(os.getpgid(0), signal.SIGTERM)
+    return real_forward(self, *a)
+
+
+def select_threshold(*a, **k):
+    mark()
+    raise RuntimeError("injected: the finish phase failed")
+
+
+seg.build_model = lambda cfg: Tiny()
+losses.ComboLoss.forward = forward
+if FAULT == "finish":
+    ev.select_threshold = select_threshold
+sys.argv = sys.argv[3:]
+runpy.run_module(sys.argv[0], run_name="__main__", alter_sys=True)
+'''
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _train_with_fault(tmp_path, fault, limit=30.0):
+    """Run the real CLI with 2 persistent DataLoader workers in its own process group and
+    inject `fault`. Returns (exit code, stdout, stderr, seconds from the event to the exit,
+    worker pids alive at the event, whether any process of the group outlived the parent)."""
+    boot = tmp_path / "fault_boot.py"
+    boot.write_text(FAULT_BOOT)
+    data = tmp_path / "data"
+    if not data.exists():
+        fake_mass(data)
+    cfg = write_cfg(tmp_path, data, epochs=2, max_train_batches=3)
+    mark = tmp_path / f"{fault}.mark"
+    mark.unlink(missing_ok=True)
+    p = subprocess.Popen([sys.executable, str(boot), fault, str(mark), "roadseg.train", "--config",
+                          str(cfg), "--rung", "R1", "--device", "cpu", "--workers", "2",
+                          "--resume", "auto"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=dict(ENV, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1"),
+                         cwd=ROOT, start_new_session=True)
+    try:
+        t0 = time.time()
+        while fault != "none" and not mark.exists() and p.poll() is None:
+            assert time.time() - t0 < 900, "the injected event never happened"
+            time.sleep(0.02)
+        t_event = time.time()
+        try:
+            out, err = p.communicate(timeout=limit if fault != "none" else 900)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
+            pytest.fail(f"still running {limit:.0f} s after the '{fault}' event (a hang):\n"
+                        f"{out}\n{err}")
+        seconds = time.time() - t_event
+        deadline = time.time() + 5
+        while _group_alive(p.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        left_behind = _group_alive(p.pid)
+    finally:
+        if _group_alive(p.pid):
+            os.killpg(p.pid, signal.SIGKILL)
+    workers = mark.read_text().split() if mark.exists() else []
+    return p.returncode, out, err, seconds, workers, left_behind
+
+
+@pytest.mark.parametrize("fault, message", [
+    ("loss", "injected: the loss failed at step 1"),
+    ("finish", "injected: the finish phase failed"),
+])
+def test_a_crash_with_live_workers_exits_1_promptly_and_leaves_no_process(tmp_path, fault, message):
+    """G1. DataLoader workers ignore SIGTERM, and Python's exit joins them without a timeout:
+    an uncaught exception used to hang the process (and with it the GPU) forever."""
+    rc, out, err, seconds, workers, left_behind = _train_with_fault(tmp_path, fault)
+    assert len(workers) == 2, (workers, out, err)          # they WERE alive when it failed
+    assert rc == tr.EXIT_CRASHED == 1, out + err
+    assert message in err and "Traceback" in err           # the reason is in the log
+    assert seconds < 30 and not left_behind
+    run = tmp_path / "runs" / "massachusetts_R1_s0"
+    assert not (run / "metrics.json").exists()
+
+    rc, out, err, _, _, left_behind = _train_with_fault(tmp_path, "none")   # the next attempt
+    assert rc == 0 and not left_behind, out + err
+    if fault == "finish":
+        assert "at epoch 2 step 0" in out                  # straight to the finish phase
+    assert read(run / "metrics.json")["best_epoch"] is not None
+
+
+def test_a_job_wide_sigterm_with_live_workers_exits_75_and_leaves_no_process(tmp_path):
+    rc, out, err, seconds, workers, left_behind = _train_with_fault(tmp_path, "sigterm")
+    assert len(workers) == 2, (workers, out, err)
+    assert rc == tr.EXIT_REQUEUE == 75, out + err
+    assert "preempted: checkpoint saved at epoch 0 step 2" in out
+    assert seconds < 30 and not left_behind
+    rc, out, err, _, _, left_behind = _train_with_fault(tmp_path, "none")
+    assert rc == 0 and not left_behind and "at epoch 0 step 2" in out, out + err
+    assert read(tmp_path / "runs" / "massachusetts_R1_s0" / "metrics.json")["resumes"] == 1
+
+
+RUN_CLI = '''import sys, time, multiprocessing, signal
+from roadseg import runtime as rt
+
+def stubborn():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)          # like a DataLoader worker
+    time.sleep(600)
+
+def main(argv):
+    multiprocessing.Process(target=stubborn, daemon=True).start()
+    time.sleep(0.3)
+    how = sys.argv[1]
+    if how == "return": return 0
+    if how == "none": return None
+    if how == "requeue": return rt.EXIT_REQUEUE
+    if how == "refused": raise rt.Refused("the run directory is locked")
+    if how == "preflight": raise rt.PreflightFailed("no CUDA device")
+    if how == "message": raise SystemExit("no epoch produced a finite validation IoU")
+    if how == "usage": raise SystemExit(2)
+    raise ValueError("boom")
+
+rt.run_cli(main)
+'''
+
+
+@pytest.mark.parametrize("how, code, stderr", [
+    ("return", 0, ""), ("none", 0, ""), ("requeue", 75, ""),
+    ("refused", 2, "refused: the run directory is locked"),
+    ("preflight", 3, "preflight failed: no CUDA device"),
+    ("message", 1, "no epoch produced a finite validation IoU"), ("usage", 2, ""),
+    ("crash", 1, "ValueError: boom"),
+])
+def test_run_cli_maps_every_ending_to_the_exit_code_contract(tmp_path, how, code, stderr):
+    """The codes the SLURM wrapper acts on, each with a SIGTERM-ignoring child alive at exit."""
+    script = tmp_path / "cli.py"
+    script.write_text(RUN_CLI)
+    t0 = time.time()
+    p = subprocess.Popen([sys.executable, str(script), how], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, env=ENV, start_new_session=True)
+    try:
+        _, err = p.communicate(timeout=60)
+        assert p.returncode == code, err
+        assert stderr in err and (stderr or err == "")
+        assert time.time() - t0 < 60 and not _group_alive(p.pid)     # the child went with it
+    finally:
+        if _group_alive(p.pid):
+            os.killpg(p.pid, signal.SIGKILL)
+    assert (tr.EXIT_OK, tr.EXIT_CRASHED, tr.EXIT_REFUSED, tr.EXIT_PREFLIGHT, tr.EXIT_REQUEUE) == (
+        0, 1, 2, 3, 75)
 
 
 @pytest.mark.slow

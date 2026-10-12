@@ -22,6 +22,21 @@ Guarantees the experiment relies on:
   consistent state, and `--resume auto` continues from it: the remaining steps
   of the interrupted epoch (the per-iteration LR schedule continues exactly),
   the remaining epochs, then the finish phase. metrics.json is published once.
+* Every way out ends the process. The DataLoader workers ignore SIGTERM, so they
+  are SIGKILLed on every exit path of `main` (stop_workers), and the CLI ends in
+  `os._exit` (runtime.run_cli): a crash fails the job at once instead of hanging.
+
+Exit codes (defined in roadseg/runtime.py; the SLURM wrapper acts on them):
+
+    0   EXIT_OK         done, or the run was already complete
+    75  EXIT_REQUEUE    interrupted by SIGTERM/SIGUSR1, checkpoint saved: requeue me
+    2   EXIT_REFUSED    refused: resume with a different configuration, an
+                        inconsistent run directory, a missing --resume checkpoint
+                        (and argparse's usage error)
+    3   EXIT_PREFLIGHT  the GPU is not usable for this run
+    1   EXIT_CRASHED    anything else: uncaught exception, traceback on stderr
+
+Only 75 is worth running again unchanged; 1, 2 and 3 would repeat themselves.
 """
 from __future__ import annotations
 
@@ -46,9 +61,10 @@ from .engine import load_checkpoint, save_checkpoint, train_one_epoch
 from .eval import evaluate, select_threshold
 from .losses import ComboLoss
 from .models.segmenter import build_model
+from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
+                      EXIT_REQUEUE, PreflightFailed, Refused, run_cli)
 
 PROJECT = Path(__file__).resolve().parents[2]
-EX_TEMPFAIL = 75                      # "preempted, checkpoint saved, run me again"
 RUNGS = ("R0", "R1", "R2", "R3")
 BASELINES = ("unet", "dlinknet")
 DATASETS = ("massachusetts", "deepglobe")
@@ -282,6 +298,44 @@ def _worker_init(worker_id: int) -> None:
     signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
 
+def stop_workers(loader) -> None:
+    """End the DataLoader's worker processes for certain. Call on EVERY way out of main.
+
+    The workers ignore SIGTERM (above). Everything that would normally end them at
+    exit uses SIGTERM: DataLoader's own fallback (`terminate`) and multiprocessing's
+    exit handler, which then joins them with no timeout. So after an uncaught
+    exception -- the traceback keeps the loader alive until interpreter shutdown --
+    the process used to hang for ever, holding its GPU. SIGKILL cannot be ignored,
+    and a worker only reads, so nothing is lost by it.
+    """
+    it = getattr(loader, "_iterator", None)
+    if it is None:
+        return
+    workers = list(getattr(it, "_workers", None) or ())
+    try:        # or torch's SIGCHLD handler raises "DataLoader worker killed" in this thread
+        if getattr(it, "_worker_pids_set", False):
+            torch.utils.data._utils.signal_handling._remove_worker_pids(id(it))
+            it._worker_pids_set = False
+    except Exception:
+        pass
+    for w in workers:
+        try:
+            if w.is_alive():
+                w.kill()
+        except Exception:
+            pass
+    for w in workers:
+        try:
+            w.join(timeout=10)
+        except Exception:
+            pass
+    try:
+        it._shutdown_workers()          # queues and the pin-memory thread; the workers are gone
+    except Exception:
+        pass
+    loader._iterator = None
+
+
 # --------------------------------------------------------------------------- durable writes
 
 def write_json_atomic(path, obj) -> None:
@@ -371,12 +425,12 @@ def load_state(path, model, optimizer, scheduler, cfg: dict, steps_per_epoch: in
     extra, old_cfg = head.get("extra", {}), head.get("cfg", {})
     del head
     if "step_in_epoch" not in extra:
-        raise SystemExit(f"refusing to resume: {path} carries no training state")
+        raise Refused(f"refusing to resume: {path} carries no training state")
     diff = config_diff(old_cfg, cfg)
     if extra.get("steps_per_epoch") != steps_per_epoch:
         diff.append(f"steps_per_epoch: {extra.get('steps_per_epoch')!r} -> {steps_per_epoch!r}")
     if diff:
-        raise SystemExit(f"refusing to resume: {path} was written by a different configuration ("
+        raise Refused(f"refusing to resume: {path} was written by a different configuration ("
                          + "; ".join(diff) + ")")
     load_checkpoint(path, model, optimizer, scheduler, map_location=map_location)
     state = {k: extra[k] for k in fresh_state()}
@@ -406,7 +460,7 @@ def repair_best(run: Path, model, cfg: dict, state: dict, log=print) -> None:
         save_checkpoint(path, model, epoch=best_epoch, best=state["best"], cfg=cfg)
         log(f"repaired best.pt from latest.pt (epoch {best_epoch}; was {on_disk})", flush=True)
         return
-    raise SystemExit(f"{path} holds epoch {on_disk} but latest.pt says the best epoch is "
+    raise Refused(f"{path} holds epoch {on_disk} but latest.pt says the best epoch is "
                      f"{best_epoch}: the run directory is inconsistent, refusing to continue")
 
 
@@ -527,7 +581,7 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
         raise SystemExit("no epoch produced a finite validation IoU; there is no best.pt to score")
     meta = load_checkpoint(run / "best.pt", model, map_location=device)
     if meta["epoch"] != state["best_epoch"]:
-        raise SystemExit(f"best.pt holds epoch {meta['epoch']}, expected {state['best_epoch']}")
+        raise Refused(f"best.pt holds epoch {meta['epoch']}, expected {state['best_epoch']}")
     geometry = dict(tile=cfg["tile"], stride=cfg["stride"], use_amp=use_amp)
     t0 = time.monotonic()
     threshold, threshold_iou = select_threshold(model, val_ds, device, **geometry)
@@ -570,7 +624,7 @@ def main(argv=None) -> int:
         done = json.loads((run / "metrics.json").read_text())
         diff = config_diff(done.get("cfg", {}), cfg)
         if diff:
-            raise SystemExit(f"refusing: {run / 'metrics.json'} exists for a different "
+            raise Refused(f"refusing: {run / 'metrics.json'} exists for a different "
                              f"configuration ({'; '.join(diff)})")
         print(f"already complete: {run / 'metrics.json'} exists; nothing to do", flush=True)
         return 0
@@ -601,14 +655,15 @@ def main(argv=None) -> int:
     elif args.resume:
         resume = Path(args.resume)
         if not resume.exists():
-            raise SystemExit(f"--resume {resume}: no such checkpoint")
+            raise Refused(f"--resume {resume}: no such checkpoint")
     if resume is None:
         stale = [f for f in ("latest.pt", "best.pt", "history.json") if (run / f).exists()]
         if stale:
-            raise SystemExit(f"refusing to start fresh: {run} already holds {stale}. Pass "
+            raise Refused(f"refusing to start fresh: {run} already holds {stale}. Pass "
                              f"--resume auto to continue that run, or remove the directory.")
 
     preempt = Preempt().install()
+    loader = None
     try:
         data = dict(root=cfg["data_root"], dataset=cfg["dataset"])
         tile_kw = dict(split="train", tile=cfg["tile"], road_bias=cfg["road_bias"],
@@ -618,7 +673,7 @@ def main(argv=None) -> int:
         if cfg["max_train_batches"] is not None:
             steps_per_epoch = min(steps_per_epoch, cfg["max_train_batches"])
         if steps_per_epoch < 1:
-            raise SystemExit(f"no full batch: {len(train_ds)} crops per epoch, "
+            raise Refused(f"no full batch: {len(train_ds)} crops per epoch, "
                              f"batch_size {cfg['batch_size']}")
 
         model, loss_fn, optimizer = build()
@@ -677,15 +732,19 @@ def main(argv=None) -> int:
                        steps_per_epoch=steps_per_epoch, use_amp=use_amp, device=device,
                        preempt=preempt, ckpt_seconds=60.0 * cfg["ckpt_minutes"], saved=saved)
         if not complete:
-            return EX_TEMPFAIL
+            return EXIT_REQUEUE
         finish(model=model, val_ds=val_ds, run=run, cfg=cfg, state=state, device=device,
                use_amp=use_amp, eval_workers=cfg["eval_workers"],
                extra={"n_params": n_params, "steps_per_epoch": steps_per_epoch,
                       "n_train_images": len(train_ds.rows), "n_val_images": len(val_ds)})
-        return 0
+        return EXIT_OK
     finally:
-        preempt.restore()
+        # Normal return, exit 75, a refusal and an uncaught exception all pass through here.
+        try:
+            stop_workers(loader)
+        finally:
+            preempt.restore()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    run_cli(main)          # ends the process with the exit-code contract; never returns

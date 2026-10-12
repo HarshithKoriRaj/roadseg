@@ -29,6 +29,7 @@ from .engine import load_checkpoint
 from .image_metrics import image_metrics
 from .metrics import confusion, metrics_from_confusion
 from .models.segmenter import build_model
+from .runtime import run_cli
 
 _COUNTS = ("tp", "fp", "fn", "tn")
 _ROW_NONMETRIC = ("id", "n_valid", "tp", "fp", "fn", "n_gt", "n_pred")
@@ -262,4 +263,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    run_cli(main)          # exit-code contract of roadseg/runtime.py; never returns
