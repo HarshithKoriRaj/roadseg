@@ -646,7 +646,8 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
     t0 = time.monotonic()
 
     # ---- stage 1: the threshold (reused if an earlier process of this run selected it)
-    key = {"best_epoch": state["best_epoch"], "best_val_iou": state["best"], **geometry}
+    key = {"best_epoch": state["best_epoch"], "best_val_iou": state["best"], **geometry,
+           "code_commit": code["commit"], "code_dirty": code["dirty"]}   # same code selected it
     saved_path = run / "threshold.json"
     saved = None
     if saved_path.exists():
@@ -765,28 +766,33 @@ def preflight(cfg: dict, device: str, use_amp: bool) -> dict:
 
 
 def run_preflight(cfg: dict, device: str, use_amp: bool, *, code: dict, device_name: str,
-                  log=print) -> dict:
+                  sentinel: bool = True, log=print) -> dict:
     """`preflight`, reported. On ANY failure: write <runs_dir>/PREFLIGHT_FAILED.<run>.txt
     (fresh runs act on these files -- see check_sentinels) and raise PreflightFailed
-    (exit code 3, never requeued)."""
+    (exit code 3, never requeued). With `sentinel=False` nothing is written: the
+    traceback goes to stderr instead (a manual check must not mark the real runs/)."""
     try:
         r = preflight(cfg, device, use_amp)
     except Exception as exc:
         name = run_name(cfg)
-        sentinel = Path(cfg["runs_dir"]) / f"{SENTINEL}{name}.txt"
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text(
+        if not sentinel:
+            traceback.print_exc()
+            raise PreflightFailed(f"{type(exc).__name__}: {exc} -- the self-test of {name} "
+                                  f"on {device_name} failed (no sentinel written)") from exc
+        path = Path(cfg["runs_dir"]) / f"{SENTINEL}{name}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
             f"run: {name}\nhost: {socket.gethostname()}\ndevice: {device} ({device_name})\n"
             f"commit: {describe_code(code)}\ntime: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
             f"job: {os.environ.get('SLURM_JOB_ID', '-')}\n"
             f"batch_size: {cfg['batch_size']}  tile: {cfg['tile']}  amp: {use_amp}\n\n"
             f"{traceback.format_exc()}\n"
-            f"A fresh `roadseg.train` in {sentinel.parent} warns about this file; once such "
+            f"A fresh `roadseg.train` in {path.parent} warns about this file; once such "
             f"files name two different hosts, fresh runs exit 3 at startup. Runs that have "
             f"latest.pt or metrics.json are never affected. Fix the cause and delete the file.\n")
         raise PreflightFailed(
             f"{type(exc).__name__}: {exc} -- the self-test of {name} on {device_name} failed "
-            f"before the run started; details in {sentinel}") from exc
+            f"before the run started; details in {path}") from exc
     log(f"preflight ok: name={r['name']} batch={r['batch']} tile={r['tile']} amp={r['amp']} "
         f"steps_per_s={r['steps_per_s']:.2f} peak_gb={r['peak_gb']:.2f} "
         f"eval_batch={PREFLIGHT_EVAL_BATCH} seconds={r['seconds']:.1f} device={device_name}",
@@ -881,7 +887,10 @@ def main(argv=None) -> int:
     if is_cuda:
         torch.backends.cudnn.benchmark = True      # before the preflight: same conv algorithms
     if args.preflight_only:                        # the canary: test this configuration, exit
-        run_preflight(cfg, device, use_amp, code=code, device_name=device_name)
+        # A sentinel only where the caller named the runs directory (the canary does): a
+        # check by hand must never leave one in the configured, real runs/.
+        run_preflight(cfg, device, use_amp, code=code, device_name=device_name,
+                      sentinel=args.runs_dir is not None)
         return EXIT_OK
     # Every job on a GPU tests the device before the real model exists (--preflight forces
     # it on a CPU). Other tasks' failures are looked at in _train, for a fresh run only.
@@ -930,7 +939,8 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
         if not resume.exists():
             raise Refused(f"--resume {resume}: no such checkpoint")
     if resume is None:
-        stale = [f for f in ("latest.pt", "best.pt", "history.json") if (run / f).exists()]
+        stale = [f for f in ("latest.pt", "best.pt", "history.json", "threshold.json")
+                 if (run / f).exists()]
         if stale:
             raise Refused(f"refusing to start fresh: {run} already holds {stale}. Pass "
                              f"--resume auto to continue that run, or remove the directory.")

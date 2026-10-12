@@ -225,7 +225,7 @@ run_step() {
     # If the child exited between the interrupted `wait` and the check above, STEP_RC is
     # still the interruption; its real status is waiting to be collected (127 = already was).
     wait "$child" 2>/dev/null || rc=$?
-    if (( rc != 0 && rc != 127 )); then
+    if (( rc != 127 )); then               # also 0: the child's real status, not the interruption
         STEP_RC=$rc
     fi
     child=""

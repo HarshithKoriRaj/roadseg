@@ -19,8 +19,9 @@
 #      the full sha (reused if it already exists; read-only);
 #   4. submits FROM the snapshot with --export=ALL,ROADSEG_CODE=<snapshot>, so every task and
 #      every requeue of it imports the same code and records it (train.py refuses to resume a
-#      checkpoint with different code). ROADSEG_PY / ROADSEG_RUNS / ROADSEG_LOGS are unset
-#      first: those are test overrides and must not leak into the real jobs;
+#      checkpoint with different code). ROADSEG_PY / ROADSEG_RUNS / ROADSEG_LOGS and every
+#      CANARY_* / SMOKE_* variable are unset first: those are test overrides and rehearsal
+#      knobs and must not leak into the real jobs;
 #   5. prints the job ids and appends them to runs/LAUNCHES.log.
 #
 # Data, .deps, runs/ and the logs stay under the project directory; only code and configs
@@ -114,7 +115,15 @@ else
 fi
 
 # ---- 4. submit from the snapshot -------------------------------------------------------------
-unset ROADSEG_PY ROADSEG_RUNS ROADSEG_LOGS ROADSEG_RUNS_SMOKE ROADSEG_RUNS_CANARY
+# --export=ALL hands this shell's environment to the job. Test overrides and the knobs for
+# rehearsing the scripts must not come along: a stray CANARY_DEVICE=cpu or SMOKE_TILE=128
+# would silently change what a real job does.
+unset ROADSEG_PY ROADSEG_RUNS ROADSEG_LOGS ROADSEG_RUNS_SMOKE ROADSEG_RUNS_CANARY \
+      ROADSEG_USR1_WATCHDOG
+for knob in $(compgen -e | grep -E '^(CANARY_|SMOKE_)' || true); do
+    echo "launch.sh: not passing $knob to the job"
+    unset "$knob"
+done
 EXPORT="--export=ALL,ROADSEG_CODE=$SNAP"
 stamp=$(date +%Y-%m-%dT%H:%M:%S%z)
 

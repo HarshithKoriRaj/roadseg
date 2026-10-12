@@ -759,6 +759,11 @@ def test_refuses_to_mix_runs_in_one_directory(tiny, capsys):
     (run / "metrics.json").unlink()                                # unfinished run on disk
     with pytest.raises(SystemExit, match="refusing to start fresh"):
         tiny.train(cfg=tiny.cfg(epochs=2))                         # no --resume: would clobber it
+    lone = tiny.runs / "massachusetts_R3_s0"                       # H8: a saved threshold alone
+    lone.mkdir()                                                   # is also a run's state
+    (lone / "threshold.json").write_text('{"threshold": 0.5}')
+    with pytest.raises(SystemExit, match=r"refusing to start fresh.*threshold\.json"):
+        tiny.train(cfg=tiny.cfg(epochs=2), name=("--rung", "R3"))
     with pytest.raises(SystemExit, match="no such checkpoint"):
         tiny.train("--resume", str(tiny.root / "nope.pt"), cfg=tiny.cfg(epochs=2))
     # what a SIGKILL in the middle of publishing metrics.json leaves behind
@@ -1530,10 +1535,21 @@ def test_preflight_only_tests_and_exits(tiny, monkeypatch, capsys):
     assert "preflight ok: name=R1" in capsys.readouterr().out and len(builds) == 1
     assert not (tiny.runs / "massachusetts_R1_s0").exists()       # no run was started
 
+    # H8: a manual check (no --runs-dir) must never leave a sentinel in the configured runs/
+    builds = _count_builds(monkeypatch, fail_first=FloatingPointError("non-finite loss nan"))
+    capsys.readouterr()
+    with pytest.raises(tr.PreflightFailed, match="non-finite loss nan") as e:
+        tiny.train("--preflight-only", name=("--rung", "R3"))
+    assert "PREFLIGHT_FAILED" not in str(e.value)
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "FloatingPointError: non-finite loss nan" in err
+    assert not tiny.runs.exists() or not list(tiny.runs.glob("PREFLIGHT_FAILED.*"))
+    # ... the canary names its own runs directory, and gets the sentinel there
+    elsewhere = tiny.root / "runs_canary"
     builds = _count_builds(monkeypatch, fail_first=FloatingPointError("non-finite loss nan"))
     with pytest.raises(tr.PreflightFailed, match="PREFLIGHT_FAILED.massachusetts_R3_s0.txt"):
-        tiny.train("--preflight-only", name=("--rung", "R3"))
-    assert "non-finite loss nan" in (tiny.runs / "PREFLIGHT_FAILED.massachusetts_R3_s0.txt").read_text()
+        tiny.train("--preflight-only", "--runs-dir", str(elsewhere), name=("--rung", "R3"))
+    assert "non-finite loss nan" in (elsewhere / "PREFLIGHT_FAILED.massachusetts_R3_s0.txt").read_text()
     builds = _count_builds(monkeypatch)                           # the canary tests them ALL:
     assert tiny.train("--preflight-only", name=("--rung", "R0")) == 0   # an earlier failure
     assert len(builds) == 1                                             # does not skip the next
@@ -1614,8 +1630,11 @@ def test_a_saved_threshold_is_only_reused_for_the_checkpoint_it_was_selected_on(
     ref = read(run / "metrics.json")
     (run / "metrics.json").unlink()
     saved = read(run / "threshold.json")
+    assert saved["code_commit"] == ref["code_commit"] and "code_dirty" in saved      # H8
     for stale in ({**saved, "best_epoch": saved["best_epoch"] + 1, "threshold": 0.8},
-                  {**saved, "stride": 1, "threshold": 0.8}, {"threshold": 0.8}):
+                  {**saved, "stride": 1, "threshold": 0.8}, {"threshold": 0.8},
+                  {**saved, "code_commit": "f" * 40, "threshold": 0.8},       # other code (H8)
+                  {**saved, "code_dirty": not saved["code_dirty"], "threshold": 0.8}):
         (run / "threshold.json").write_text(json.dumps(stale))
         assert tiny.train("--resume", "auto") == 0
         assert read(run / "metrics.json")["threshold"] == ref["threshold"]      # selected afresh
@@ -1700,7 +1719,7 @@ FAKE_SBATCH = '''#!/bin/bash
 # records its arguments and the ROADSEG_* variables it was given; answers with a job id
 n=$(( $(cat "$FAKE_SBATCH_LOG" 2>/dev/null | grep -c '^sbatch') + 1 ))
 echo "sbatch $*" >> "$FAKE_SBATCH_LOG"
-echo "env PY=${ROADSEG_PY-<unset>} RUNS=${ROADSEG_RUNS-<unset>} LOGS=${ROADSEG_LOGS-<unset>}" >> "$FAKE_SBATCH_LOG"
+echo "env PY=${ROADSEG_PY-<unset>} RUNS=${ROADSEG_RUNS-<unset>} LOGS=${ROADSEG_LOGS-<unset>} leaked=[$(env | grep -E '^(CANARY_|SMOKE_|ROADSEG_USR1_WATCHDOG=)' | cut -d= -f1 | sort | tr '\\n' ' ')]" >> "$FAKE_SBATCH_LOG"
 echo "$(( 9000 + n ));torch"
 '''
 
@@ -1744,6 +1763,9 @@ def _launch(tmp_path, repo, *args, smoke=None, env_extra=None):
            "ROADSEG_SLURM_LOGS": str(tmp_path / "slurm_logs"),
            "FAKE_SBATCH_LOG": str(tmp_path / "sbatch.log"),
            "ROADSEG_PY": "/test/python", "ROADSEG_RUNS": "/test/runs", "ROADSEG_LOGS": "/test/logs",
+           # knobs of a script rehearsal still exported in the operator's shell (H8):
+           "CANARY_DEVICE": "cpu", "CANARY_MINI": "--epochs 1", "SMOKE_STEPS": "drills",
+           "SMOKE_TILE": "128", "ROADSEG_USR1_WATCHDOG": "1",
            **(env_extra or {})}
     r = subprocess.run(["bash", str(LAUNCH), *args], capture_output=True, text=True, env=env)
     log = tmp_path / "sbatch.log"
@@ -1869,11 +1891,11 @@ def test_launch_freezes_a_snapshot_and_submits_from_it(tmp_path):
     assert sorted(p.name for p in snap.iterdir()) == [".gitignore", "COMMIT", "scripts", "src"]
     assert not os.access(snap / "src/roadseg/train.py", os.W_OK)             # frozen
     export = f"--export=ALL,ROADSEG_CODE={snap}"
-    assert calls == [
-        f"sbatch --parsable {export} {snap}/scripts/sbatch_train_array.sh",
-        "env PY=<unset> RUNS=<unset> LOGS=<unset>",                 # test overrides do not leak
+    clean = "env PY=<unset> RUNS=<unset> LOGS=<unset> leaked=[]"   # no test override, no
+    assert calls == [                                              # CANARY_* / SMOKE_* knob
+        f"sbatch --parsable {export} {snap}/scripts/sbatch_train_array.sh", clean,
         f"sbatch --parsable --dependency=afterany:9001 {export} {snap}/scripts/sbatch_aggregate.sh",
-        "env PY=<unset> RUNS=<unset> LOGS=<unset>"]
+        clean]
     assert "array job: 9001" in out and "aggregate job: 9002" in out and str(snap) in out
     line = (repo / "runs" / "LAUNCHES.log").read_text().splitlines()
     assert len(line) == 1 and line[0].endswith(f"sha={sha} snapshot={snap} array=9001 aggregate=9002")
