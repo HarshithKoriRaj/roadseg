@@ -58,6 +58,15 @@ def tmp_name(path) -> Path:
 
 
 _HELD: set[str] = set()                # lock files this process holds (see RunLock.acquire)
+LOCK_RETRY_SECONDS = 180.0             # a restarted job waits this long for a held lock ...
+LOCK_RETRY_INTERVAL = 15.0             # ... trying again this often (see RunLock.acquire)
+
+
+def _restart_count() -> int:
+    try:
+        return int(os.environ.get("SLURM_RESTART_COUNT") or 0)
+    except ValueError:
+        return 0
 
 
 class RunLock:
@@ -75,28 +84,54 @@ class RunLock:
         self.path = self.run / ".lock"
         self.fd: int | None = None
 
-    def acquire(self) -> "RunLock":
-        """Take the lock or raise Refused (exit code 2) naming the run and the holder."""
+    def acquire(self, wait: float | None = None, interval: float | None = None) -> "RunLock":
+        """Take the lock or raise Refused (exit code 2) naming the run and the holder.
+
+        A first start is refused at once. A RESTARTED job (SLURM_RESTART_COUNT > 0) retries
+        every LOCK_RETRY_INTERVAL seconds for up to LOCK_RETRY_SECONDS first: if the previous
+        attempt died with its node, the NFS server keeps its lock until the lease expires
+        (~90 s), and that must not cost the task. `wait` / `interval` override both.
+        """
         self.run.mkdir(parents=True, exist_ok=True)
         key = os.path.realpath(self.path)
         # POSIX locks never conflict inside one process, and closing ANY descriptor of the
         # file drops them all -- so a second holder in this process must be refused here.
         if key in _HELD:
             raise Refused(f"run directory {self.run} is locked by this very process")
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
+        if wait is None:
+            wait = LOCK_RETRY_SECONDS if _restart_count() > 0 else 0.0
+        if interval is None:
+            interval = LOCK_RETRY_INTERVAL
+        deadline = time.monotonic() + wait
+        announced = False
+        while True:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
             try:
-                holder = os.pread(fd, 300, 0).decode(errors="replace").strip()
-            except OSError:
-                holder = ""
-            os.close(fd)
-            if e.errno not in (errno.EACCES, errno.EAGAIN):
-                raise
-            raise Refused(f"run directory {self.run} is locked by another process "
-                          f"({holder or 'holder unknown'}). Two processes writing one run "
-                          f"would corrupt it; not starting.") from None
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                try:
+                    holder = os.pread(fd, 300, 0).decode(errors="replace").strip()
+                except OSError:
+                    holder = ""
+                os.close(fd)
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise Refused(
+                        f"run directory {self.run} is locked by another process "
+                        f"({holder or 'holder unknown'})"
+                        + (f", still after retrying for {wait:g} s" if wait > 0 else "")
+                        + ". Two processes writing one run would corrupt it; not starting."
+                    ) from None
+                if not announced:
+                    print(f"run directory {self.run} is locked ({holder or 'holder unknown'}); "
+                          f"this job was restarted, so the holder may have died with its node: "
+                          f"retrying every {interval:g} s for up to {wait:g} s", file=sys.stderr,
+                          flush=True)
+                    announced = True
+                time.sleep(max(0.0, min(interval, left)))
         os.ftruncate(fd, 0)
         os.pwrite(fd, f"{socket.gethostname()} pid {os.getpid()} since "
                       f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode(), 0)
@@ -109,10 +144,14 @@ class RunLock:
             return
         fd, self.fd = self.fd, None
         _HELD.discard(os.path.realpath(self.path))
-        try:
-            fcntl.lockf(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        # This runs in a `finally` / `__exit__`: an OSError here (NFS) would replace the
+        # process's real outcome -- 0 or 75 -- with a crash. Nothing depends on it: the
+        # kernel drops the lock when the process ends.
+        for step in (lambda: fcntl.lockf(fd, fcntl.LOCK_UN), lambda: os.close(fd)):
+            try:
+                step()
+            except OSError:
+                pass
 
     def __enter__(self) -> "RunLock":
         return self if self.fd is not None else self.acquire()

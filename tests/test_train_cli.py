@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REAL_MASS = ROOT / "data" / "massachusetts"
 ENV = dict(os.environ, PYTHONPATH=f"{ROOT}/.deps:{ROOT}/src", OMP_NUM_THREADS="2",
            MKL_NUM_THREADS="2", TORCH_HOME="/scratch/hk4488/.cache/torch")
+ENV.pop("SLURM_RESTART_COUNT", None)     # H4: a restarted job retries a held lock for 3 minutes
 METRICS_KEYS = {"cfg", "threshold", "val", "per_image", "best_epoch", "best_val_iou", "history",
                 "n_params", "git_commit", "torch_version", "device_name", "hostname",
                 "wall_seconds", "code_commit", "code_dirty", "processes", "code_changes"}
@@ -2454,6 +2455,90 @@ def test_run_lock_inside_one_process(tmp_path):
         with pytest.raises(tr.Refused):
             tr.RunLock(run).acquire()
     tr.RunLock(run).acquire().release()
+
+
+def test_releasing_the_lock_never_changes_the_exit_code(tiny, monkeypatch, tmp_path):
+    """H3. release() runs in a `finally`: an OSError there (NFS) would turn exit 0 or 75
+    into a crash. The kernel drops the lock at process exit anyway."""
+    import roadseg.runtime as rt
+    real_lockf, real_close = rt.fcntl.lockf, os.close
+    failures = []
+
+    def lockf(fd, op, *a):
+        if op == rt.fcntl.LOCK_UN:
+            failures.append("unlock")
+            raise OSError(5, "Input/output error (simulated)")
+        return real_lockf(fd, op, *a)
+
+    monkeypatch.setattr(rt.fcntl, "lockf", lockf)
+    _preempt_at_step(monkeypatch, 6)
+    assert tiny.train() == 75                                    # not a crash
+    assert tiny.train("--resume", "auto") == 0                   # and the lock was free again
+    assert failures == ["unlock", "unlock"]
+
+    lock = tr.RunLock(tmp_path / "run").acquire()                # ... and a failing close()
+    fd = lock.fd
+
+    def close(f):
+        if f == fd:
+            failures.append("close")
+            raise OSError(116, "Stale file handle (simulated)")
+        return real_close(f)
+
+    monkeypatch.setattr(os, "close", close)
+    lock.release()                                               # must not raise
+    with tr.RunLock(tmp_path / "run"):                           # usable afterwards
+        pass
+    assert failures[-3:] == ["unlock", "close", "unlock"]
+    monkeypatch.setattr(os, "close", real_close)
+    real_close(fd)
+
+
+def test_a_restarted_job_waits_for_a_dead_nodes_lock_but_a_first_start_does_not(tmp_path,
+                                                                                monkeypatch):
+    """H4. A node that died keeps its NFS lock until the lease expires (~90 s); the requeued
+    task must not be refused for that. Only with SLURM_RESTART_COUNT > 0; bounded."""
+    import roadseg.runtime as rt
+    assert (rt.LOCK_RETRY_SECONDS, rt.LOCK_RETRY_INTERVAL) == (180.0, 15.0)
+    holder = tmp_path / "holder.py"
+    holder.write_text(LOCK_HOLDER)
+    run, ready = tmp_path / "runs" / "massachusetts_R1_s0", tmp_path / "ready"
+    p = subprocess.Popen([sys.executable, str(holder), str(run), "return", str(ready)], env=ENV)
+    try:
+        t0 = time.time()
+        while not ready.exists():
+            assert p.poll() is None and time.time() - t0 < 60
+            time.sleep(0.02)
+
+        def timed(**kw):
+            t = time.monotonic()
+            try:
+                tr.RunLock(run).acquire(**kw).release()
+                return "acquired", time.monotonic() - t
+            except tr.Refused as e:
+                assert "is locked by another process" in str(e) and f"pid {p.pid} " in str(e)
+                return "refused", time.monotonic() - t
+
+        monkeypatch.setattr(rt, "LOCK_RETRY_SECONDS", 0.6)
+        monkeypatch.setattr(rt, "LOCK_RETRY_INTERVAL", 0.05)
+        for count in (None, "0"):                                 # a first start: at once
+            monkeypatch.delenv("SLURM_RESTART_COUNT", raising=False)
+            if count is not None:
+                monkeypatch.setenv("SLURM_RESTART_COUNT", count)
+            assert timed() == ("refused", pytest.approx(0, abs=0.2))
+        monkeypatch.setenv("SLURM_RESTART_COUNT", "2")            # a restart: retries, bounded
+        what, seconds = timed()
+        assert what == "refused" and 0.6 <= seconds < 2
+        assert timed(wait=0)[1] < 0.2                             # explicit parameters win
+
+        import threading
+        threading.Timer(0.5, ready.unlink).start()                # the lease "expires"
+        what, seconds = timed(wait=10, interval=0.05)
+        assert what == "acquired" and 0.4 <= seconds < 5
+        assert p.wait(timeout=30) == 0
+    finally:
+        if p.poll() is None:
+            p.kill()
 
 
 def test_temp_names_are_unique_per_process_and_stale_ones_are_cleared_under_the_lock(tiny,
