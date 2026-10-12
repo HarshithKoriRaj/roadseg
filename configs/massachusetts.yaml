@@ -1,0 +1,4 @@
+_base: base.yaml
+dataset: massachusetts
+data_root: /scratch/hk4488/roadseg/data/massachusetts
+epochs: 100

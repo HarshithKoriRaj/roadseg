@@ -1,0 +1,4 @@
+_base: base.yaml
+dataset: deepglobe
+data_root: /scratch/hk4488/roadseg/data/deepglobe
+epochs: 40

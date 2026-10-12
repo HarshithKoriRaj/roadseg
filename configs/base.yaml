@@ -1,0 +1,26 @@
+# Shared by every run. A dataset config names this file under `_base` and overrides it;
+# CLI flags of `python -m roadseg.train` override both. The fully resolved config is
+# recorded in each run's metrics.json.
+model: roadsegmenter      # roadsegmenter | unet | dlinknet
+rung: R1                  # R0..R3 (roadsegmenter only)
+pretrained: true          # ImageNet weights from $TORCH_HOME
+hf_init: exact            # stem init for the DWT input (R1/R2/R3)
+
+tile: 512                 # training crop and inference tile
+stride: 256               # inference stride for threshold selection and final scoring
+val_stride: 512           # per-epoch validation (checkpoint selection): no overlap, fast
+
+batch_size: 16
+lr: 3.0e-4
+weight_decay: 1.0e-4
+warmup_epochs: 2          # linear warmup from 0.01*lr, then cosine to 0.01*lr, per iteration
+road_bias: 0.75
+amp: true                 # bf16 autocast
+
+num_workers: 8            # DataLoader workers
+eval_workers: 8           # process pool for the per-image CPU metrics of the finish phase
+preload: true             # decode train + val once into RAM (~12.5 GB Mass., ~18.3 GB DeepGlobe)
+ckpt_minutes: 10          # wall-clock interval of mid-epoch latest.pt (preemption safety)
+
+seed: 0
+runs_dir: /scratch/hk4488/roadseg/runs
