@@ -767,8 +767,8 @@ def preflight(cfg: dict, device: str, use_amp: bool) -> dict:
 def run_preflight(cfg: dict, device: str, use_amp: bool, *, code: dict, device_name: str,
                   log=print) -> dict:
     """`preflight`, reported. On ANY failure: write <runs_dir>/PREFLIGHT_FAILED.<run>.txt
-    (which makes every other task of the launch stop at startup -- see check_sentinels)
-    and raise PreflightFailed (exit code 3, never requeued)."""
+    (fresh runs act on these files -- see check_sentinels) and raise PreflightFailed
+    (exit code 3, never requeued)."""
     try:
         r = preflight(cfg, device, use_amp)
     except Exception as exc:
@@ -781,8 +781,9 @@ def run_preflight(cfg: dict, device: str, use_amp: bool, *, code: dict, device_n
             f"job: {os.environ.get('SLURM_JOB_ID', '-')}\n"
             f"batch_size: {cfg['batch_size']}  tile: {cfg['tile']}  amp: {use_amp}\n\n"
             f"{traceback.format_exc()}\n"
-            f"While this file exists every `roadseg.train` in {sentinel.parent} exits 3 at "
-            f"startup. Fix the cause, delete the file, and launch again.\n")
+            f"A fresh `roadseg.train` in {sentinel.parent} warns about this file; once such "
+            f"files name two different hosts, fresh runs exit 3 at startup. Runs that have "
+            f"latest.pt or metrics.json are never affected. Fix the cause and delete the file.\n")
         raise PreflightFailed(
             f"{type(exc).__name__}: {exc} -- the self-test of {name} on {device_name} failed "
             f"before the run started; details in {sentinel}") from exc
@@ -793,15 +794,45 @@ def run_preflight(cfg: dict, device: str, use_amp: bool, *, code: dict, device_n
     return r
 
 
-def check_sentinels(runs_dir) -> None:
-    """Exit 3 if any task's preflight has failed in this runs directory: the other tasks
-    of the launch would fail the same way, each after its own day in the queue."""
-    found = sorted(Path(runs_dir).glob(f"{SENTINEL}*")) if Path(runs_dir).is_dir() else []
-    if found:
+def sentinel_hosts(runs_dir) -> dict:
+    """{host: [sentinel files]} of the failed preflights recorded in `runs_dir`. The host is
+    the file's `host:` line; a file without one is its own, distinct, unknown host."""
+    hosts: dict = {}
+    if not Path(runs_dir).is_dir():
+        return hosts
+    for p in sorted(Path(runs_dir).glob(f"{SENTINEL}*")):
+        host = None
+        try:
+            for line in p.read_text(errors="replace").splitlines():
+                if line.startswith("host:"):
+                    host = line[len("host:"):].strip() or None
+                    break
+        except OSError:
+            pass
+        hosts.setdefault(host or f"unknown host ({p.name})", []).append(p)
+    return hosts
+
+
+def check_sentinels(runs_dir, log=print) -> None:
+    """Should a FRESH run start here, given the preflights that have failed?
+
+    Failures on two or more distinct hosts mean the code or the configuration: every
+    other fresh task would fail the same way after its own day in the queue, so exit 3.
+    Failures on a single host can be one bad GPU: warn, and let this run's own preflight
+    decide. Never call this for a run that has latest.pt or metrics.json -- a run that
+    has trained has proven the code path, and must not be held up by other tasks.
+    """
+    hosts = sentinel_hosts(runs_dir)
+    if not hosts:
+        return
+    listing = "; ".join(f"{h}: {', '.join(str(p) for p in files)}" for h, files in hosts.items())
+    if len(hosts) >= 2:
         raise PreflightFailed(
-            f"{found[0]} exists" + (f" (and {len(found) - 1} more)" if len(found) > 1 else "")
-            + ": a preflight failed in this runs directory, so no run starts here. Read it, "
-              "fix the cause, delete it, launch again (--skip-preflight overrides).")
+            f"preflights have failed on {len(hosts)} different hosts ({listing}). That is the "
+            f"code or the configuration, not one bad GPU, so no fresh run starts here. Read "
+            f"the files, fix the cause, delete them, launch again (--skip-preflight overrides).")
+    log(f"WARNING: a preflight has failed on one host ({listing}). One host can be one bad "
+        f"GPU: this run goes on to its own preflight.", flush=True)
 
 
 # --------------------------------------------------------------------------- entrypoint
@@ -853,13 +884,11 @@ def main(argv=None) -> int:
         run_preflight(cfg, device, use_amp, code=code, device_name=device_name)
         return EXIT_OK
     # Every job on a GPU tests the device before the real model exists (--preflight forces
-    # it on a CPU). A failure anywhere stops every task that starts afterwards.
+    # it on a CPU). Other tasks' failures are looked at in _train, for a fresh run only.
     self_test = None
-    if not args.skip_preflight:
-        check_sentinels(cfg["runs_dir"])
-        if is_cuda or args.preflight:
-            def self_test():
-                run_preflight(cfg, device, use_amp, code=code, device_name=device_name)
+    if not args.skip_preflight and (is_cuda or args.preflight):
+        def self_test():
+            run_preflight(cfg, device, use_amp, code=code, device_name=device_name)
 
     # One writer per run directory, from before any state is read until the process ends
     # (the kernel drops the lock on any exit, SIGKILL included). Refused -> exit code 2.
@@ -887,6 +916,11 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
                           f"configuration ({'; '.join(diff)})")
         print(f"already complete: {run / 'metrics.json'} exists; nothing to do", flush=True)
         return EXIT_OK
+    # Other tasks' failed preflights concern a FRESH run only (after "already complete", and
+    # never with a latest.pt): one bad node must not stop healthy resumes or leave finished
+    # trainings unscored.
+    if not args.skip_preflight and not (run / "latest.pt").exists():
+        check_sentinels(cfg["runs_dir"])
 
     resume = None
     if args.resume == "auto":

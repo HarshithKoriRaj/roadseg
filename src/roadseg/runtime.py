@@ -13,8 +13,9 @@ them whether to requeue, score, or fail the task:
                         changed since the checkpoint, test split already scored
                         (also argparse's usage error)
     3   EXIT_PREFLIGHT  the GPU is not usable for this run: `--device cuda` without
-                        CUDA, or the preflight self-test failed (or an earlier task's
-                        did: a PREFLIGHT_FAILED.* file is in the runs directory)
+                        CUDA, or the preflight self-test failed (or, for a fresh run,
+                        other tasks' preflights failed on two or more hosts:
+                        PREFLIGHT_FAILED.* files in the runs directory)
     75  EXIT_REQUEUE    interrupted by a signal, checkpoint saved, run me again
 
 Only 75 is ever requeued. 1, 2 and 3 would fail the same way again.

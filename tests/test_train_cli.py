@@ -1403,30 +1403,95 @@ def test_preflight_exercises_the_real_step_and_the_real_loss(tiny, monkeypatch):
     assert seen["loss"] == [False, False]
 
 
-def test_a_failed_preflight_leaves_a_sentinel_that_stops_every_other_run(tiny, monkeypatch, capsys):
-    """G6. One failing task must stop the other 35 from burning queue time: exit code 3
-    (never requeued), and a PREFLIGHT_FAILED.* file that makes every later start exit 3."""
+def _sentinel(runs, name, host):
+    """What a failed preflight of run `name` on `host` leaves behind (host None: malformed)."""
+    runs.mkdir(parents=True, exist_ok=True)
+    p = runs / f"PREFLIGHT_FAILED.{name}.txt"
+    p.write_text((f"run: {name}\nhost: {host}\n" if host else "half a fi")
+                 + "device: cuda (NVIDIA L40S)\n\nTraceback (most recent call last): ...\n")
+    return p
+
+
+def test_a_failed_preflight_writes_a_sentinel_and_exits_3(tiny, monkeypatch, capsys):
+    """G6. The task whose own preflight fails exits 3 (never requeued) and leaves
+    PREFLIGHT_FAILED.<run>.txt. H1: that one file, from one host, stops nobody else."""
     builds = _count_builds(monkeypatch, fail_first=RuntimeError("CUDA out of memory (simulated)"))
     sentinel = tiny.runs / "PREFLIGHT_FAILED.massachusetts_R1_s0.txt"
     with pytest.raises(tr.PreflightFailed, match="PREFLIGHT_FAILED.massachusetts_R1_s0.txt"):
         tiny.train("--preflight")
     text = sentinel.read_text()
     assert "CUDA out of memory (simulated)" in text and "Traceback" in text
-    assert socket.gethostname() in text and tr.code_identity()["commit"] in text
+    assert f"host: {socket.gethostname()}\n" in text and tr.code_identity()["commit"] in text
     assert "device: cpu" in text and "run: massachusetts_R1_s0" in text
     run = tiny.runs / "massachusetts_R1_s0"
     assert len(builds) == 1 and not (run / "latest.pt").exists()  # the real model never existed
+    assert tr.sentinel_hosts(tiny.runs) == {socket.gethostname(): [sentinel]}
 
-    for flags in ((), ("--preflight",), ("--resume", "auto")):    # any other task, CPU or GPU
-        with pytest.raises(tr.PreflightFailed, match="PREFLIGHT_FAILED.massachusetts_R1_s0.txt"):
+    capsys.readouterr()
+    assert tiny.train("--preflight", name=("--rung", "R2")) == 0  # another task: goes ahead
+    out = capsys.readouterr().out
+    assert "WARNING" in out and sentinel.name in out and socket.gethostname() in out
+    assert out.index("WARNING") < out.index("preflight ok:")      # ... to its OWN preflight
+    assert tiny.train("--preflight") == 0                         # and so does a relaunch of R1
+
+
+def test_sentinels_stop_a_fresh_run_only_when_two_hosts_failed(tiny, monkeypatch, capsys):
+    """H1. One host can be one bad GPU; two hosts is the code. Only then is a fresh run
+    refused (exit 3) -- and a finished run is still 'already complete'."""
+    builds = _count_builds(monkeypatch)
+    a = _sentinel(tiny.runs, "deepglobe_R0_s0", "gl001")
+    assert tiny.train() == 0                                      # fresh run, one sentinel
+    out = capsys.readouterr().out
+    assert "WARNING" in out and a.name in out and "gl001" in out
+    _sentinel(tiny.runs, "deepglobe_R0_s1", "gl001")              # the same host again:
+    assert tiny.train(name=("--rung", "R0")) == 0                 # still one host
+
+    b = _sentinel(tiny.runs, "deepglobe_R3_s2", "gl002")
+    n = len(builds)
+    for flags in ((), ("--preflight",), ("--resume", "auto")):    # a fresh run, however started
+        with pytest.raises(tr.PreflightFailed) as e:
             tiny.train(*flags, name=("--rung", "R2"))
-    assert len(builds) == 1                                       # ... stops before building
-    assert not (tiny.runs / "massachusetts_R2_s0").exists()
+        msg = str(e.value)
+        assert a.name in msg and b.name in msg and "gl001" in msg and "gl002" in msg
+        assert "2 different hosts" in msg
+    assert len(builds) == n                                       # ... stops before building
+    assert not (tiny.runs / "massachusetts_R2_s0" / "latest.pt").exists()
     assert tiny.train("--dry-run", name=("--rung", "R2")) == 0    # (a dry run is not a run)
 
+    capsys.readouterr()
+    for flags in ((), ("--resume", "auto"), ("--preflight",)):    # R1 has metrics.json:
+        assert tiny.train(*flags) == 0                            # a requeue must reach scoring
+        assert "already complete" in capsys.readouterr().out
     assert tiny.train("--skip-preflight", name=("--rung", "R2")) == 0   # disables both
-    sentinel.unlink()                                             # the operator's all-clear
-    assert tiny.train("--preflight") == 0
+
+
+def test_a_run_that_has_trained_never_consults_sentinels(tiny, monkeypatch, capsys):
+    """H1. latest.pt proves the code path on some GPU: a resume is never held up by other
+    tasks' sentinels (it still runs its own preflight)."""
+    calls = _preempt_at_step(monkeypatch, 6)
+    assert tiny.train() == 75
+    _sentinel(tiny.runs, "deepglobe_R0_s0", "gl001")
+    _sentinel(tiny.runs, "deepglobe_R3_s2", "gl002")
+    capsys.readouterr()
+    assert tiny.train("--resume", "auto", "--preflight") == 0
+    out = capsys.readouterr().out
+    assert "resumed from" in out and "at epoch 1 step 2" in out and "preflight ok:" in out
+    assert "WARNING" not in out and "PREFLIGHT_FAILED" not in out
+    assert len(calls) == 12 + 2                  # the 12 steps of the run + the preflight's 2
+
+
+def test_a_malformed_sentinel_counts_as_its_own_unknown_host(tiny, monkeypatch, capsys):
+    bad = _sentinel(tiny.runs, "deepglobe_unet_s0", None)         # no `host:` line
+    assert list(tr.sentinel_hosts(tiny.runs)) == [f"unknown host ({bad.name})"]
+    assert tiny.train() == 0                                      # alone: one host
+    assert "WARNING" in capsys.readouterr().out
+    good = _sentinel(tiny.runs, "deepglobe_R0_s0", "gl001")
+    with pytest.raises(tr.PreflightFailed, match="unknown host.*gl001|gl001.*unknown host"):
+        tiny.train(name=("--rung", "R2"))
+    good.unlink()
+    _sentinel(tiny.runs, "deepglobe_unet_s1", None)               # two malformed files are
+    with pytest.raises(tr.PreflightFailed, match="2 different hosts"):   # two unknown hosts
+        tiny.train(name=("--rung", "R2"))
 
 
 def test_preflight_only_tests_and_exits(tiny, monkeypatch, capsys):
