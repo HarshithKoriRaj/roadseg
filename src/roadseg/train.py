@@ -82,7 +82,7 @@ _REQUIRED = ("dataset", "data_root", "epochs", "tile", "stride", "val_stride", "
              "lr", "weight_decay", "warmup_epochs", "road_bias", "num_workers", "amp",
              "preload", "seed", "runs_dir")
 _DEFAULTS = {"model": "roadsegmenter", "rung": "R1", "pretrained": True, "hf_init": "exact",
-             "ckpt_minutes": 10, "eval_workers": 8,
+             "ckpt_minutes": 5, "eval_workers": 8,
              "max_train_batches": None, "limit_train": None, "limit_val": None}
 # Keys that may differ between the process that wrote a checkpoint and the one resuming it:
 # they change how fast the run goes or where it lives, never what it computes.
@@ -598,11 +598,20 @@ def fit(*, model, optimizer, scheduler, loss_fn, batches_for, validate, run: Pat
 # --------------------------------------------------------------------------- finish
 
 def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use_amp: bool,
-           eval_workers: int, extra: dict, device_name: str = "cpu", log=print) -> bool:
+           eval_workers: int, extra: dict, device_name: str = "cpu", preempt=None,
+           log=print) -> bool | None:
     """Freeze checkpoint and threshold on VALIDATION and publish metrics.json once.
 
     Pure function of best.pt and the validation set, so a kill anywhere in here is
-    repaired by running it again. Returns False if metrics.json already existed.
+    repaired by running it again -- training is never redone. Two stages:
+
+      1. threshold selection -> threshold.json (atomic). If `preempt` is set by then,
+         stop: returns None, the caller exits 75, and the requeued job reuses the saved
+         threshold and redoes only stage 2.
+      2. validation scoring (the long one: relaxed F1, clDice, APLS) -> metrics.json.
+         A signal during it does not discard the scores: publishing is one rename.
+
+    Returns True if metrics.json was published, False if it already existed.
     Provenance comes from `state` (fixed at startup): the code this process runs,
     every process that worked on the run, and any allowed code change.
     """
@@ -615,7 +624,37 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
         raise Refused(f"best.pt holds epoch {meta['epoch']}, expected {state['best_epoch']}")
     geometry = dict(tile=cfg["tile"], stride=cfg["stride"], use_amp=use_amp)
     t0 = time.monotonic()
-    threshold, threshold_iou = select_threshold(model, val_ds, device, **geometry)
+
+    # ---- stage 1: the threshold (reused if an earlier process of this run selected it)
+    key = {"best_epoch": state["best_epoch"], "best_val_iou": state["best"], **geometry}
+    saved_path = run / "threshold.json"
+    saved = None
+    if saved_path.exists():
+        try:
+            saved = json.loads(saved_path.read_text())
+        except ValueError:
+            saved = None
+        if not (isinstance(saved, dict) and all(saved.get(k) == v for k, v in key.items())
+                and isinstance(saved.get("threshold"), float)
+                and isinstance(saved.get("threshold_val_iou"), float)):
+            saved = None                       # another checkpoint or geometry: select afresh
+    if saved is not None:
+        threshold, threshold_iou = saved["threshold"], saved["threshold_val_iou"]
+        before = float(saved.get("seconds", 0.0))
+        log(f"threshold {threshold:.2f} (val IoU {threshold_iou:.4f}) reused from {saved_path}",
+            flush=True)
+    else:
+        threshold, threshold_iou = select_threshold(model, val_ds, device, **geometry)
+        before = 0.0
+        write_json_atomic(saved_path, {**key, "threshold": threshold,
+                                       "threshold_val_iou": threshold_iou,
+                                       "seconds": round(time.monotonic() - t0, 3)})
+        if preempt:
+            log(f"preempted: finish phase stopped after threshold selection ({threshold:.2f}, "
+                f"saved in {saved_path}); only the validation scoring is left", flush=True)
+            return None
+
+    # ---- stage 2: score validation at that threshold and publish
     agg, rows = evaluate(model, val_ds, threshold, device, full_metrics=True, with_apls=True,
                          workers=eval_workers, **geometry)
     payload = {
@@ -629,7 +668,7 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
         "torch_version": torch.__version__,
         "device_name": device_name,
         "hostname": socket.gethostname(),
-        "wall_seconds": round(state["wall_seconds"] + (time.monotonic() - t0), 3),
+        "wall_seconds": round(state["wall_seconds"] + before + (time.monotonic() - t0), 3),
         **extra,
     }
     published = publish_json_once(run / "metrics.json", payload)
@@ -919,12 +958,13 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
                        preempt=preempt, ckpt_seconds=60.0 * cfg["ckpt_minutes"], saved=saved)
         if not complete:
             return EXIT_REQUEUE
-        finish(model=model, val_ds=val_ds, run=run, cfg=cfg, state=state, device=device,
-               use_amp=use_amp, eval_workers=cfg["eval_workers"],
-               device_name=device_name,
-               extra={"n_params": n_params, "steps_per_epoch": steps_per_epoch,
-                      "n_train_images": len(train_ds.rows), "n_val_images": len(val_ds)})
-        return EXIT_OK
+        published = finish(model=model, val_ds=val_ds, run=run, cfg=cfg, state=state,
+                           device=device, use_amp=use_amp, eval_workers=cfg["eval_workers"],
+                           device_name=device_name, preempt=preempt,
+                           extra={"n_params": n_params, "steps_per_epoch": steps_per_epoch,
+                                  "n_train_images": len(train_ds.rows),
+                                  "n_val_images": len(val_ds)})
+        return EXIT_REQUEUE if published is None else EXIT_OK
     finally:
         # Normal return, exit 75, a refusal and an uncaught exception all pass through here.
         try:

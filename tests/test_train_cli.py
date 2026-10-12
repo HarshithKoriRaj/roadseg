@@ -38,6 +38,8 @@ ENV = dict(os.environ, PYTHONPATH=f"{ROOT}/.deps:{ROOT}/src", OMP_NUM_THREADS="2
 METRICS_KEYS = {"cfg", "threshold", "val", "per_image", "best_epoch", "best_val_iou", "history",
                 "n_params", "git_commit", "torch_version", "device_name", "hostname",
                 "wall_seconds", "code_commit", "code_dirty", "processes", "code_changes"}
+# A finished run directory holds exactly these (G2: the lock file; G7: the saved threshold).
+RUN_FILES = [".lock", "best.pt", "history.json", "latest.pt", "metrics.json", "threshold.json"]
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -137,7 +139,9 @@ def test_shipped_configs_resolve_their_base():
     expected = dict(model="roadsegmenter", rung="R1", pretrained=True, hf_init="exact", tile=512,
                     stride=256, val_stride=512, batch_size=16, lr=3.0e-4, weight_decay=1.0e-4,
                     warmup_epochs=2, road_bias=0.75, num_workers=8, amp=True, preload=True,
-                    seed=0, runs_dir="/scratch/hk4488/roadseg/runs", ckpt_minutes=10)
+                    seed=0, runs_dir="/scratch/hk4488/roadseg/runs",
+                    ckpt_minutes=5)       # G7: the kill grace is 30 s; bound the loss by time
+    assert tr._DEFAULTS["ckpt_minutes"] == 5
     for cfg in (mass, deep):
         assert {k: cfg[k] for k in expected} == expected
         assert isinstance(cfg["lr"], float) and isinstance(cfg["weight_decay"], float)
@@ -633,8 +637,7 @@ def test_resume_refuses_a_checkpoint_from_another_configuration(tmp_path):
 def test_end_to_end_writes_everything_once_and_is_idempotent(tiny, capsys):
     assert tiny.train() == 0
     run = tiny.runs / "massachusetts_R1_s0"
-    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
-                                                     "latest.pt", "metrics.json"]
+    assert sorted(p.name for p in run.iterdir()) == RUN_FILES
     m = read(run / "metrics.json")
     assert METRICS_KEYS <= set(m)
     cfg = m["cfg"]
@@ -743,8 +746,7 @@ def test_refuses_to_mix_runs_in_one_directory(tiny, capsys):
     out = capsys.readouterr().out
     assert "resumed from" in out and "at epoch 2 step 0" in out
     assert read(run / "metrics.json")["resumes"] == 1
-    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
-                                                     "latest.pt", "metrics.json"]   # debris cleared
+    assert sorted(p.name for p in run.iterdir()) == RUN_FILES             # debris cleared
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR1])
@@ -850,7 +852,7 @@ def assert_nothing_partial_is_visible(run: Path):
         if p.name.startswith(".") or p.suffix == ".tmp":
             continue                                   # temp names are never read by anything
         assert p.name in {"latest.pt", "best.pt", "history.json", "metrics.json",
-                          "test_metrics.json"}, p.name
+                          "threshold.json", "test_metrics.json"}, p.name
         if p.suffix == ".json":
             json.loads(p.read_text())
         else:
@@ -927,9 +929,8 @@ def test_kill_at_every_point_then_resume_reaches_the_uninterrupted_result(tiny, 
 
         assert published.count("metrics.json") == 1, what           # written exactly once
         assert published.count("test_metrics.json") == 1, what      # scored exactly once
-        assert sorted(p.name for p in run.iterdir()) == [
-            ".lock", "best.pt", "history.json", "latest.pt", "metrics.json",
-            "test_metrics.json"], what
+        assert sorted(p.name for p in run.iterdir()) == sorted(
+            [*RUN_FILES, "test_metrics.json"]), what
         assert_nothing_partial_is_visible(run)
         m, hist = read(run / "metrics.json"), read(run / "history.json")
         assert [r["epoch"] for r in hist] == [0, 1, 2] and m["history"] == hist, what
@@ -973,8 +974,7 @@ def test_a_second_kill_during_the_resume_is_also_harmless(tiny, monkeypatch):
         assert tiny.train("--resume", "auto", cfg=cfg) == 0, (k1, k2)
         published += faults.published
         assert published.count("metrics.json") == 1, (k1, k2)
-        assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
-                                                         "latest.pt", "metrics.json"], (k1, k2)
+        assert sorted(p.name for p in run.iterdir()) == RUN_FILES, (k1, k2)
         m = read(run / "metrics.json")
         got = (weights_digest(run / "best.pt"), weights_digest(run / "latest.pt"),
                [(r["epoch"], r["val_iou"], r["lr"]) for r in read(run / "history.json")],
@@ -1444,6 +1444,158 @@ def test_preflight_only_tests_and_exits(tiny, monkeypatch, capsys):
     assert len(builds) == 1                                             # does not skip the next
     with pytest.raises(SystemExit):                               # argparse: contradictory
         tiny.train("--preflight-only", "--skip-preflight")
+
+
+# ----------------------------------------------------------------------------- G7: finish phase
+
+def test_a_signal_during_threshold_selection_exits_75_and_only_the_scoring_is_redone(
+        tiny, monkeypatch, capsys):
+    """G7. The finish phase honours the preempt flag between its stages. The threshold is
+    saved (threshold.json) before the flag is looked at, so the requeued job does not
+    select it again -- and never retrains."""
+    assert tiny.train() == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+    ref = read(run / "metrics.json")
+    assert read(run / "threshold.json")["threshold"] == ref["threshold"]
+    shutil.rmtree(tiny.runs)
+
+    calls = {"select": 0, "score": 0, "steps": 0}
+    real_select, real_evaluate, real_loss = tr.select_threshold, tr.evaluate, tr.ComboLoss
+
+    def select(*a, **k):
+        calls["select"] += 1
+        os.kill(os.getpid(), signal.SIGTERM)                # arrives DURING threshold selection
+        return real_select(*a, **k)
+
+    def evaluate(*a, **k):
+        calls["score"] += bool(k.get("full_metrics"))
+        return real_evaluate(*a, **k)
+
+    class Loss(real_loss):
+        def forward(self, *a):
+            calls["steps"] += 1
+            return super().forward(*a)
+
+    monkeypatch.setattr(tr, "select_threshold", select)
+    monkeypatch.setattr(tr, "evaluate", evaluate)
+    monkeypatch.setattr(tr, "ComboLoss", Loss)
+    assert tiny.train() == 75
+    out = capsys.readouterr().out
+    assert "preempted: finish phase stopped after threshold selection" in out
+    assert calls == {"select": 1, "score": 0, "steps": 12}
+    saved = read(run / "threshold.json")
+    assert saved["threshold"] == ref["threshold"] and saved["best_epoch"] == ref["best_epoch"]
+    assert not (run / "metrics.json").exists()
+
+    monkeypatch.setattr(tr, "select_threshold", real_select)
+    assert tiny.train("--resume", "auto") == 0
+    out = capsys.readouterr().out
+    assert "at epoch 3 step 0" in out and "threshold 0." in out and "reused from" in out
+    assert calls == {"select": 1, "score": 1, "steps": 12}     # no retraining, no re-selection
+    m = read(run / "metrics.json")
+    assert (m["threshold"], m["threshold_val_iou"], m["val"], m["per_image"]) == (
+        ref["threshold"], ref["threshold_val_iou"], ref["val"], ref["per_image"])
+    assert m["resumes"] == 1 and len(m["processes"]) == 2
+    assert sorted(p.name for p in run.iterdir()) == RUN_FILES
+
+
+def test_a_signal_during_validation_scoring_still_publishes_the_finished_run(tiny, monkeypatch):
+    """After scoring nothing is left but a rename: publish, do not throw the scores away."""
+    real_evaluate = tr.evaluate
+
+    def evaluate(*a, **k):
+        if k.get("full_metrics"):
+            os.kill(os.getpid(), signal.SIGUSR1)
+        return real_evaluate(*a, **k)
+
+    monkeypatch.setattr(tr, "evaluate", evaluate)
+    assert tiny.train() == 0
+    assert (tiny.runs / "massachusetts_R1_s0" / "metrics.json").exists()
+
+
+def test_a_saved_threshold_is_only_reused_for_the_checkpoint_it_was_selected_on(tiny, monkeypatch):
+    assert tiny.train() == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+    ref = read(run / "metrics.json")
+    (run / "metrics.json").unlink()
+    saved = read(run / "threshold.json")
+    for stale in ({**saved, "best_epoch": saved["best_epoch"] + 1, "threshold": 0.8},
+                  {**saved, "stride": 1, "threshold": 0.8}, {"threshold": 0.8}):
+        (run / "threshold.json").write_text(json.dumps(stale))
+        assert tiny.train("--resume", "auto") == 0
+        assert read(run / "metrics.json")["threshold"] == ref["threshold"]      # selected afresh
+        assert read(run / "threshold.json")["threshold"] == ref["threshold"]
+        (run / "metrics.json").unlink()
+
+
+# ----------------------------------------------------------------------------- G7: aggregate
+
+AGGREGATE = ROOT / "scripts" / "sbatch_aggregate.sh"
+
+
+def _aggregate(tmp_path, missing=(), *args, spec=None):
+    """The REAL aggregate script with a stub python; every run of the map has a
+    test_metrics.json except `missing`. Returns (exit code, stub log, stdout+stderr)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / "python"
+    fake.write_text(FAKE_PYTHON.format(python=sys.executable))
+    fake.chmod(0o755)
+    runs, log = tmp_path / "runs", tmp_path / "log"
+    log.unlink(missing_ok=True)
+    shutil.rmtree(runs, ignore_errors=True)
+    for _, _, _, _, name in _print_map():
+        if name not in missing:
+            (runs / name).mkdir(parents=True)
+            (runs / name / "test_metrics.json").write_text("{}")
+    env = {"PATH": os.environ["PATH"], "FAKE_LOG": str(log), "FAKE_SPEC": json.dumps(spec or {}),
+           "ROADSEG_PY": str(fake), "ROADSEG_RUNS": str(runs)}
+    r = subprocess.run(["bash", str(AGGREGATE), *args], capture_output=True, text=True, env=env)
+    return r.returncode, (log.read_text().splitlines() if log.exists() else []), r.stdout + r.stderr
+
+
+def test_aggregate_refuses_a_partial_set_but_still_prints_the_table(tmp_path):
+    """G7. `afterany` starts the aggregation whatever happened to the array: a table over
+    35 runs must not look like the result."""
+    stats = [f"stats argv -m roadseg.stats --runs-dir {tmp_path / 'runs'} --dataset {d} --split test"
+             for d in ("massachusetts", "deepglobe")]
+    rc, log, out = _aggregate(tmp_path)
+    assert rc == 0 and log == stats and "36 of 36" in out and "MISSING" not in out, out
+
+    gone = ("deepglobe_R3_s2", "massachusetts_unet_s0")
+    rc, log, out = _aggregate(tmp_path, gone)
+    assert rc != 0 and log == stats, out                        # the table either way
+    assert "34 of 36" in out and "INCOMPLETE" in out
+    assert all(f"MISSING {name}" in out for name in gone) and out.count("MISSING ") == 2
+
+    rc, log, out = _aggregate(tmp_path, gone, "--allow-partial", "--metric", "cl_dice")
+    assert rc == 0, out
+    assert log == [s + " --metric cl_dice" for s in stats]      # the flag is ours, not stats'
+    assert "34 of 36" in out and "--allow-partial" in out and out.count("MISSING ") == 2
+
+    # --allow-partial excuses missing runs, not a failed aggregation
+    rc, log, out = _aggregate(tmp_path, gone, "--allow-partial", spec={"stats": {"rc": 1}})
+    assert rc != 0 and "AGGREGATE FAILED for massachusetts" in out and len(log) == 2, out
+
+
+# ----------------------------------------------------------------------------- G7: smoke script
+
+SMOKE = ROOT / "scripts" / "sbatch_smoke_cpu.sh"
+
+
+def test_smoke_acknowledgement_is_only_written_by_the_full_rehearsal(tmp_path):
+    """G7. launch.sh trusts runs_smoke/SMOKE_PASSED. A narrowed rehearsal (here: no section
+    at all) prints its verdict but must not write the acknowledgement."""
+    runs = tmp_path / "runs_smoke"
+    r = subprocess.run(["bash", str(SMOKE)], capture_output=True, text=True,
+                       env=dict(ENV, ROADSEG_RUNS_SMOKE=str(runs), SMOKE_STEPS="none"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SMOKE: ALL PASSED" in r.stdout
+    assert "SMOKE_PASSED not written" in r.stdout and "narrowed" in r.stdout
+    assert not (runs / "SMOKE_PASSED").exists()
+    src = SMOKE.read_text()
+    assert 'kill -TERM -- "-$pid"' in src and "setsid" in src     # drills signal the GROUP
+    assert "ROADSEG_CODE" in src and 'echo "$SHA" > "$RUNS/SMOKE_PASSED"' in src
 
 
 # ----------------------------------------------------------------------------- G5: launch.sh
@@ -2202,11 +2354,9 @@ def test_temp_names_are_unique_per_process_and_stale_ones_are_cleared_under_the_
     assert ev.main(["--run", str(run), "--split", "test", "--tile", "32", "--stride", "16",
                     "--workers", "0"]) == 0
     assert {d for _, d in renamed} == {"latest.pt", "best.pt", "history.json", "metrics.json",
-                                       "test_metrics.json"}
+                                       "threshold.json", "test_metrics.json"}
     assert all(s == f".{d}.{me}" for s, d in renamed), renamed    # train, engine and eval
-    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
-                                                     "latest.pt", "metrics.json",
-                                                     "test_metrics.json"]
+    assert sorted(p.name for p in run.iterdir()) == sorted([*RUN_FILES, "test_metrics.json"])
 
     debris = [".latest.pt.cl014.4242.tmp", ".best.pt.gl003.7.tmp", ".history.json.cl014.4242.tmp",
               ".test_metrics.json.cl014.99.tmp", "latest.tmp", ".history.json.tmp"]
@@ -2265,8 +2415,7 @@ def test_a_second_process_on_a_running_run_is_refused_and_the_first_finishes_cor
             first.kill()
     assert first.returncode == 0, out + err
     assert_nothing_partial_is_visible(run)
-    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
-                                                     "latest.pt", "metrics.json"]
+    assert sorted(p.name for p in run.iterdir()) == RUN_FILES
     m, expected = read(run / "metrics.json"), read(tmp_path / "ref/massachusetts_R1_s0/metrics.json")
     assert m["resumes"] == 0 and m["history"] and m["threshold"] == expected["threshold"]
     assert [(r["epoch"], r["val_iou"], r["lr"]) for r in m["history"]] == [
@@ -2307,6 +2456,25 @@ def test_real_data_end_to_end(tmp_path):
     assert t["threshold"] == m["threshold"]
     r = _cli("roadseg.eval", *score)
     assert r.returncode == 2 and "already exists" in r.stderr
+
+
+@pytest.mark.slow
+@needs_data
+@needs_ram
+def test_the_smoke_drills_rehearsed_with_a_job_wide_sigterm(tmp_path):
+    """G7. The two preemption drills of the CPU rehearsal, as the script runs them: real
+    ResNeXt, real data, DataLoader workers, SIGTERM to the whole process group."""
+    runs = tmp_path / "runs_smoke"
+    env = dict(ENV, ROADSEG_RUNS_SMOKE=str(runs), SMOKE_STEPS="drills", SMOKE_TILE="128",
+               SMOKE_THREADS="4")
+    env.pop("ROADSEG_CODE", None)
+    r = subprocess.run(["bash", str(SMOKE)], capture_output=True, text=True, timeout=3000, env=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out[-6000:]
+    assert out.count("final state ok: 2 history rows") == 2 and "SMOKE: ALL PASSED" in out
+    assert out.count("preempted: checkpoint saved at epoch") >= 2
+    assert "bf16 autocast on CPU" not in out and "score the test split" not in out   # drills only
+    assert "SMOKE_PASSED not written" in out and not (runs / "SMOKE_PASSED").exists()
 
 
 @pytest.mark.slow

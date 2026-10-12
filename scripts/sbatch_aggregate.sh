@@ -10,13 +10,18 @@
 #SBATCH --partition=cpu_short
 #SBATCH --account=torch_pr_627_general
 #
-# Aggregate the test results of every finished run: mean +- std over seeds per rung and
-# the paired bootstrap of each rung against R0, for both datasets. Submit behind the array:
+# Aggregate the test results: mean +- std over seeds per rung and the paired bootstrap of each
+# rung against R0, for both datasets. scripts/launch.sh submits it behind the array with
+# --dependency=afterany, i.e. it runs whatever happened to the 36 tasks. So:
 #
-#   jid=$(sbatch --parsable scripts/sbatch_train_array.sh)
-#   sbatch --dependency=afterany:$jid scripts/sbatch_aggregate.sh
+#   * all 36 runs scored            -> the tables, exit 0
+#   * anything missing              -> the missing runs are listed, the tables over what IS there
+#                                      are still printed (marked INCOMPLETE), and the job exits
+#                                      non-zero: a table over 35 runs must not pass for the result
+#   * --allow-partial               -> same output, exit 0 (if the aggregation itself succeeds)
 #
-# Extra arguments are passed to `python -m roadseg.stats` (e.g. --metric cl_dice).
+# By hand, e.g. after rerunning a failed task:  bash scripts/sbatch_aggregate.sh [--allow-partial]
+# Other arguments are passed to `python -m roadseg.stats` (e.g. --metric cl_dice).
 # Writes $RUNS/<dataset>_test_summary.json. A dataset whose R0 runs are not finished fails
 # loudly; the other one is still aggregated and the job exits non-zero.
 
@@ -30,17 +35,58 @@ export ROADSEG_CODE="$CODE"
 export PYTHONPATH="$PROJECT/.deps:$CODE/src"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
+allow_partial=0
+stats_args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--allow-partial" ]]; then
+        allow_partial=1
+    else
+        stats_args+=("$arg")
+    fi
+done
+
 cd "$PROJECT"
 commit=$(cat "$CODE/COMMIT" 2>/dev/null || git -C "$CODE" rev-parse HEAD 2>/dev/null || echo unknown)
 echo "host $(hostname)  code $CODE  commit $commit  runs $RUNS  $(date)"
-echo "finished runs: $(ls "$RUNS"/*/test_metrics.json 2>/dev/null | wc -l) of 36"
+
+# ---- which of the 36 runs are scored? (the same map the array uses) --------------------------
+missing=()
+total=0
+while read -r _ _ _ _ name; do
+    total=$(( total + 1 ))
+    [[ -s "$RUNS/$name/test_metrics.json" ]] || missing+=("$name")
+done < <(bash "$CODE/scripts/sbatch_train_array.sh" --print-map)
+if (( total != 36 )); then
+    echo "AGGREGATE FAILED: the run map has $total entries, expected 36" >&2
+    exit 1
+fi
+echo "scored runs: $(( total - ${#missing[@]} )) of $total"
+for name in ${missing[@]+"${missing[@]}"}; do
+    reason="no test_metrics.json"
+    [[ -e "$RUNS/$name/metrics.json" ]] || reason="training not finished (no metrics.json)"
+    [[ -d "$RUNS/$name" ]] || reason="never started (no run directory)"
+    echo "MISSING $name: $reason"
+done
+ls "$RUNS"/PREFLIGHT_FAILED.* 2>/dev/null | sed 's/^/NOTE preflight sentinel: /'
 
 status=0
 for dataset in massachusetts deepglobe; do
-    echo "=== $dataset ==="
-    if ! "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test "$@"; then
+    echo "=== $dataset$( (( ${#missing[@]} )) && echo '  (INCOMPLETE: not all runs are scored, see above)') ==="
+    if ! "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test \
+            ${stats_args[@]+"${stats_args[@]}"}; then
         echo "AGGREGATE FAILED for $dataset" >&2
         status=1
     fi
 done
+
+if (( ${#missing[@]} )); then
+    if (( allow_partial )); then
+        echo "INCOMPLETE: ${#missing[@]} of $total runs are missing; accepted because of --allow-partial"
+    else
+        echo "INCOMPLETE: ${#missing[@]} of $total runs are missing (listed above). The tables above" \
+             "are NOT the result. Rerun the missing tasks, then aggregate again" \
+             "(--allow-partial accepts a partial set)." >&2
+        status=1
+    fi
+fi
 exit "$status"

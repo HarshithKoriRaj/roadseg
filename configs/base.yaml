@@ -20,7 +20,8 @@ amp: true                 # bf16 autocast
 num_workers: 8            # DataLoader workers
 eval_workers: 8           # process pool for the per-image CPU metrics of the finish phase
 preload: true             # decode train + val once into RAM (~12.5 GB Mass., ~18.3 GB DeepGlobe)
-ckpt_minutes: 10          # wall-clock interval of mid-epoch latest.pt (preemption safety)
+ckpt_minutes: 5           # wall-clock interval of mid-epoch latest.pt. The cluster's kill grace
+                          # is 30 s, so a signal cannot be relied on to save: bound the loss by time
 
 seed: 0
 runs_dir: /scratch/hk4488/roadseg/runs
