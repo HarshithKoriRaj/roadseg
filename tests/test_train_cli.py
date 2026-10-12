@@ -679,7 +679,10 @@ def test_end_to_end_writes_everything_once_and_is_idempotent(tiny, capsys):
     best = torch.load(run / "best.pt", map_location="cpu", weights_only=False)
     assert best["epoch"] == m["best_epoch"] and best["best"] == m["best_val_iou"]
     assert 0.2 <= m["threshold"] <= 0.8 and len(m["per_image"]) == m["val"]["n_images"] == 2
-    assert "apls" in m["per_image"][0] and "cl_dice" in m["per_image"][0]
+    # W4: validation gets relaxed F1 and clDice but NOT APLS (nothing uses it; it would hold
+    # the GPU for minutes of CPU graph matching). Test scoring keeps APLS -- see below.
+    assert {"cl_dice", "relaxed_f1", "iou"} <= set(m["per_image"][0])
+    assert "apls" not in m["per_image"][0] and "mean_apls" not in m["val"]
     assert m["device_name"] == "cpu" and m["torch_version"] == torch.__version__
     assert len(m["git_commit"]) == 40 and m["n_params"] == sum(p.numel() for p in Tiny().parameters())
     assert m["code_commit"] == m["git_commit"] and m["code_changes"] == []
@@ -699,6 +702,7 @@ def test_end_to_end_writes_everything_once_and_is_idempotent(tiny, capsys):
     assert ev.main(["--run", str(run), "--split", "test", *small]) == 0
     t = read(run / "test_metrics.json")
     assert t["threshold"] == m["threshold"] and t["cfg"] == cfg and len(t["per_image"]) == 3
+    assert "apls" in t["per_image"][0] and "mean_apls" in t["aggregate"]      # W4: test keeps it
     assert t["eval"]["checkpoint_epoch"] == m["best_epoch"]
     assert ev.main(["--run", str(run), "--split", "test", *small]) == 2      # scored once
 
@@ -2369,7 +2373,7 @@ def test_real_data_pipeline_with_a_stub_model(tmp_path, monkeypatch, capsys):
     assert (m["n_train_images"], m["n_val_images"], m["steps_per_epoch"]) == (4, 1, 3)
     row = m["per_image"][0]
     assert 0 < row["n_valid"] <= 1500 * 1500 and row["n_gt"] > 0 and row["n_pred"] == 0
-    assert {"apls", "cl_dice", "iou"} <= set(row)
+    assert {"cl_dice", "relaxed_f1", "iou"} <= set(row) and "apls" not in row   # W4
     capsys.readouterr()
     assert tr.main(args) == 0 and "already complete" in capsys.readouterr().out
 

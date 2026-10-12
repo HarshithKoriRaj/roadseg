@@ -629,7 +629,7 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
       1. threshold selection -> threshold.json (atomic). If `preempt` is set by then,
          stop: returns None, the caller exits 75, and the requeued job reuses the saved
          threshold and redoes only stage 2.
-      2. validation scoring (the long one: relaxed F1, clDice, APLS) -> metrics.json.
+      2. validation scoring (relaxed F1, clDice; no APLS) -> metrics.json.
          A signal during it does not discard the scores: publishing is one rename.
 
     Returns True if metrics.json was published, False if it already existed.
@@ -677,7 +677,9 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
             return None
 
     # ---- stage 2: score validation at that threshold and publish
-    agg, rows = evaluate(model, val_ds, threshold, device, full_metrics=True, with_apls=True,
+    # No APLS here: nothing uses validation APLS, and its graph matching would hold the GPU
+    # for minutes of CPU work. Relaxed F1 and clDice stay; test scoring (eval.py) keeps APLS.
+    agg, rows = evaluate(model, val_ds, threshold, device, full_metrics=True, with_apls=False,
                          workers=eval_workers, **geometry)
     payload = {
         "cfg": cfg, "threshold": threshold, "threshold_val_iou": threshold_iou,
