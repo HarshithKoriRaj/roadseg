@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -632,8 +633,8 @@ def test_resume_refuses_a_checkpoint_from_another_configuration(tmp_path):
 def test_end_to_end_writes_everything_once_and_is_idempotent(tiny, capsys):
     assert tiny.train() == 0
     run = tiny.runs / "massachusetts_R1_s0"
-    assert sorted(p.name for p in run.iterdir()) == ["best.pt", "history.json", "latest.pt",
-                                                     "metrics.json"]
+    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
+                                                     "latest.pt", "metrics.json"]
     m = read(run / "metrics.json")
     assert METRICS_KEYS <= set(m)
     cfg = m["cfg"]
@@ -739,8 +740,8 @@ def test_refuses_to_mix_runs_in_one_directory(tiny, capsys):
     out = capsys.readouterr().out
     assert "resumed from" in out and "at epoch 2 step 0" in out
     assert read(run / "metrics.json")["resumes"] == 1
-    assert sorted(p.name for p in run.iterdir()) == ["best.pt", "history.json", "latest.pt",
-                                                     "metrics.json"]      # debris cleared
+    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
+                                                     "latest.pt", "metrics.json"]   # debris cleared
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR1])
@@ -916,8 +917,7 @@ def test_kill_at_every_point_then_resume_reaches_the_uninterrupted_result(tiny, 
 
         faults.arm(None)                                   # the requeued job
         assert tiny.train("--resume", "auto", cfg=cfg) == 0, what
-        for stale in run.glob(".test_metrics.json.*.tmp"):  # the SLURM wrapper does this
-            stale.unlink()
+        # (no cleanup in between: the scorer clears a killed scorer's temp file itself)
         assert ev.main(["--run", str(run), "--split", "test", *small]) == 0, what
         assert ev.main(["--run", str(run), "--split", "test", *small]) == 2, what
         published += faults.published
@@ -925,7 +925,8 @@ def test_kill_at_every_point_then_resume_reaches_the_uninterrupted_result(tiny, 
         assert published.count("metrics.json") == 1, what           # written exactly once
         assert published.count("test_metrics.json") == 1, what      # scored exactly once
         assert sorted(p.name for p in run.iterdir()) == [
-            "best.pt", "history.json", "latest.pt", "metrics.json", "test_metrics.json"], what
+            ".lock", "best.pt", "history.json", "latest.pt", "metrics.json",
+            "test_metrics.json"], what
         assert_nothing_partial_is_visible(run)
         m, hist = read(run / "metrics.json"), read(run / "history.json")
         assert [r["epoch"] for r in hist] == [0, 1, 2] and m["history"] == hist, what
@@ -969,8 +970,8 @@ def test_a_second_kill_during_the_resume_is_also_harmless(tiny, monkeypatch):
         assert tiny.train("--resume", "auto", cfg=cfg) == 0, (k1, k2)
         published += faults.published
         assert published.count("metrics.json") == 1, (k1, k2)
-        assert sorted(p.name for p in run.iterdir()) == ["best.pt", "history.json", "latest.pt",
-                                                         "metrics.json"], (k1, k2)
+        assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
+                                                         "latest.pt", "metrics.json"], (k1, k2)
         m = read(run / "metrics.json")
         got = (weights_digest(run / "best.pt"), weights_digest(run / "latest.pt"),
                [(r["epoch"], r["val_iou"], r["lr"]) for r in read(run / "history.json")],
@@ -1249,12 +1250,15 @@ def test_wrapper_exit_codes(tmp_path):
     assert rc != 0 and len(_requeues(log)) == 1, out  # could not requeue: do not report success
 
 
-def test_wrapper_clears_stale_scoring_temp_files(tmp_path):
+def test_wrapper_leaves_temp_files_to_the_process_that_holds_the_lock(tmp_path):
+    """G2. The wrapper used to `rm` scoring temp files before starting eval; without the run's
+    lock that could delete the file of a scorer still alive. roadseg.eval clears debris
+    itself, under the lock (test_temp_names_are_unique_per_process_...)."""
     run = tmp_path / "runs" / "massachusetts_R1_s1"
     run.mkdir(parents=True)
-    (run / ".test_metrics.json.4242.tmp").write_text("{")
+    (run / ".test_metrics.json.cl014.4242.tmp").write_text("{")
     rc, log, out = _wrapper(tmp_path, {})
-    assert rc == 0 and not list(run.glob(".test_metrics.json.*.tmp")), out
+    assert rc == 0 and len(list(run.glob(".test_metrics.json.*.tmp"))) == 1, out
 
 
 # ----------------------------------------------------------------------------- real CLI
@@ -1393,11 +1397,11 @@ def test_real_data_pipeline_with_a_stub_model(tmp_path, monkeypatch, capsys):
 
 
 BOOT = '''"""The real `python -m roadseg.train` in a real process, with the 4-channel stub model."""
-import runpy, sys, time
+import os, runpy, sys, time
 import torch.nn as nn
 import roadseg.models.segmenter as seg
 
-DELAY = float(sys.argv[1])
+DELAY = sys.argv[1]                 # seconds per training step, or a file: wait while it exists
 
 
 class Tiny(nn.Module):
@@ -1407,8 +1411,11 @@ class Tiny(nn.Module):
                                  nn.Conv2d(4, 1, 1))
 
     def forward(self, x):
-        if self.training:
-            time.sleep(DELAY)                   # stretch an optimizer step so it can be hit
+        if self.training and os.sep in DELAY:
+            while os.path.exists(DELAY):
+                time.sleep(0.02)
+        elif self.training:
+            time.sleep(float(DELAY))            # stretch an optimizer step so it can be hit
         return self.net(x)
 
 
@@ -1659,6 +1666,179 @@ def test_run_cli_maps_every_ending_to_the_exit_code_contract(tmp_path, how, code
             os.killpg(p.pid, signal.SIGKILL)
     assert (tr.EXIT_OK, tr.EXIT_CRASHED, tr.EXIT_REFUSED, tr.EXIT_PREFLIGHT, tr.EXIT_REQUEUE) == (
         0, 1, 2, 3, 75)
+
+
+# ----------------------------------------------------------------------------- G2: one writer
+
+LOCK_HOLDER = '''import os, signal, sys, time
+from roadseg import runtime as rt
+
+def main(argv):
+    run, how, ready = sys.argv[1:4]
+    rt.RunLock(run).acquire()
+    if how == "sigkill" and os.fork() == 0:       # like a DataLoader worker: inherits the fd,
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)     # and outlives its SIGKILLed parent
+        time.sleep(600)
+        os._exit(0)
+    open(ready, "w").close()
+    while os.path.exists(ready):                  # hold the lock until told to end
+        time.sleep(0.02)
+    if how == "return": return 0
+    if how == "requeue": return rt.EXIT_REQUEUE
+    if how == "crash": raise RuntimeError("boom")
+    time.sleep(600)
+
+rt.run_cli(main)
+'''
+LOCK_TRY = ("import sys\nfrom roadseg import runtime as rt\n"
+            "rt.run_cli(lambda argv: print('acquired', rt.RunLock(sys.argv[1]).acquire().path))\n")
+
+
+@pytest.mark.parametrize("how, code", [("return", 0), ("requeue", 75), ("crash", 1),
+                                       ("sigkill", -signal.SIGKILL)])
+def test_run_lock_refuses_a_second_process_and_is_released_however_the_first_ends(tmp_path, how,
+                                                                                  code):
+    """G2. Exclusive while the holder lives; free after a normal exit, exit 75, a crash and
+    SIGKILL -- the last even while a forked child still holds the inherited descriptor."""
+    holder, attempt = tmp_path / "holder.py", tmp_path / "try.py"
+    holder.write_text(LOCK_HOLDER)
+    attempt.write_text(LOCK_TRY)
+    run, ready = tmp_path / "runs" / "massachusetts_R1_s0", tmp_path / "ready"
+
+    def second():
+        return subprocess.run([sys.executable, str(attempt), str(run)], capture_output=True,
+                              text=True, env=ENV, timeout=60)
+
+    p = subprocess.Popen([sys.executable, str(holder), str(run), how, str(ready)], env=ENV,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        t0 = time.time()
+        while not ready.exists():
+            assert p.poll() is None and time.time() - t0 < 60, p.stderr.read()
+            time.sleep(0.02)
+        r = second()
+        assert r.returncode == tr.EXIT_REFUSED == 2, r.stdout + r.stderr
+        assert "is locked by another process" in r.stderr and str(run) in r.stderr
+        assert f"pid {p.pid} " in r.stderr                       # says who holds it
+        assert second().returncode == 2                          # and trying did not break it
+        if how == "sigkill":
+            p.kill()
+        else:
+            ready.unlink()
+        assert p.wait(timeout=60) == code      # (not communicate: the orphan keeps the pipe open)
+        r = second()
+        assert r.returncode == 0 and "acquired" in r.stdout, r.stdout + r.stderr
+    finally:
+        if _group_alive(p.pid):
+            os.killpg(p.pid, signal.SIGKILL)
+
+
+def test_run_lock_inside_one_process(tmp_path):
+    """POSIX locks do not conflict within a process and die with ANY close of the file, so
+    a second holder in the same process is refused explicitly; release makes it free."""
+    run = tmp_path / "run"
+    lock = tr.RunLock(run).acquire()
+    assert (run / ".lock").read_text().startswith(f"{socket.gethostname()} pid {os.getpid()} ")
+    with pytest.raises(tr.Refused, match="locked by this very process"):
+        tr.RunLock(run).acquire()
+    lock.release()
+    lock.release()                                               # idempotent
+    with tr.RunLock(run):
+        with pytest.raises(tr.Refused):
+            tr.RunLock(run).acquire()
+    tr.RunLock(run).acquire().release()
+
+
+def test_temp_names_are_unique_per_process_and_stale_ones_are_cleared_under_the_lock(tiny,
+                                                                                     monkeypatch):
+    """G2. Every temp file carries host and pid (two writers never share an inode), and the
+    startup cleanup -- which runs holding the lock, so every temp it sees is dead -- removes
+    the debris of any earlier process, whatever its name."""
+    me = f"{socket.gethostname()}.{os.getpid()}.tmp"
+    assert tr.tmp_name("/x/latest.pt").name == f".latest.pt.{me}"
+    renamed, real_replace, real_link = [], os.replace, os.link
+    monkeypatch.setattr(os, "replace", lambda s, d: (renamed.append((Path(s).name, Path(d).name)),
+                                                     real_replace(s, d))[1])
+    monkeypatch.setattr(os, "link", lambda s, d: (renamed.append((Path(s).name, Path(d).name)),
+                                                  real_link(s, d))[1])
+    assert tiny.train(cfg=tiny.cfg(epochs=2)) == 0
+    run = tiny.runs / "massachusetts_R1_s0"
+    assert ev.main(["--run", str(run), "--split", "test", "--tile", "32", "--stride", "16",
+                    "--workers", "0"]) == 0
+    assert {d for _, d in renamed} == {"latest.pt", "best.pt", "history.json", "metrics.json",
+                                       "test_metrics.json"}
+    assert all(s == f".{d}.{me}" for s, d in renamed), renamed    # train, engine and eval
+    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
+                                                     "latest.pt", "metrics.json",
+                                                     "test_metrics.json"]
+
+    debris = [".latest.pt.cl014.4242.tmp", ".best.pt.gl003.7.tmp", ".history.json.cl014.4242.tmp",
+              ".test_metrics.json.cl014.99.tmp", "latest.tmp", ".history.json.tmp"]
+    for name in debris:
+        (run / name).write_bytes(b"torn")
+    assert ev.main(["--run", str(run), "--split", "test", "--workers", "0"]) == 2   # scored once
+    assert not [p.name for p in run.iterdir() if p.name.endswith(".tmp")]    # eval cleared them
+    for name in debris:
+        (run / name).write_bytes(b"torn")
+    assert tiny.train("--resume", "auto", cfg=tiny.cfg(epochs=2)) == 0       # "already complete"
+    assert not [p.name for p in run.iterdir() if p.name.endswith(".tmp")]    # train did too
+
+
+@pytest.mark.slow
+def test_a_second_process_on_a_running_run_is_refused_and_the_first_finishes_correctly(tmp_path):
+    """G2 with the real CLI: while one training process owns the run directory, a second
+    `roadseg.train` and a `roadseg.eval --split test` on it both exit 2 untouched."""
+    boot = tmp_path / "boot.py"
+    boot.write_text(BOOT)
+    cfg = write_cfg(tmp_path, fake_mass(tmp_path / "data"), epochs=2, max_train_batches=6,
+                    ckpt_minutes=0)
+    env = dict(ENV, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    run = tmp_path / "runs" / "massachusetts_R1_s0"
+
+    def cmd(delay, runs="runs", module="roadseg.train"):
+        tail = (["--config", str(cfg), "--rung", "R1", "--device", "cpu", "--runs-dir",
+                 str(tmp_path / runs), "--resume", "auto"] if module == "roadseg.train" else
+                ["--run", str(run), "--split", "test", "--tile", "32", "--stride", "16",
+                 "--workers", "0"])
+        return [sys.executable, str(boot), str(delay), module, *tail]
+
+    ref = subprocess.run(cmd(0, "ref"), capture_output=True, text=True, env=env, cwd=ROOT)
+    assert ref.returncode == 0, ref.stdout + ref.stderr
+
+    hold = tmp_path / "hold"
+    hold.touch()                                 # the first process stops inside its first step
+    first = subprocess.Popen(cmd(hold), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env=env, cwd=ROOT)
+    try:
+        t0 = time.time()
+        while not ((run / ".lock").exists() and (run / ".lock").stat().st_size):
+            assert first.poll() is None, first.communicate()
+            assert time.time() - t0 < 600
+            time.sleep(0.05)
+        for module in ("roadseg.train", "roadseg.eval"):
+            r = subprocess.run(cmd(0, module=module), capture_output=True, text=True, env=env,
+                               cwd=ROOT)
+            assert first.poll() is None, "the first process ended before the second was refused"
+            assert r.returncode == 2, r.stdout + r.stderr
+            assert "is locked by another process" in r.stderr and str(run) in r.stderr
+            assert f"pid {first.pid} " in r.stderr and "Traceback" not in r.stderr
+        hold.unlink()
+        out, err = first.communicate(timeout=900)
+    finally:
+        if first.poll() is None:
+            first.kill()
+    assert first.returncode == 0, out + err
+    assert_nothing_partial_is_visible(run)
+    assert sorted(p.name for p in run.iterdir()) == [".lock", "best.pt", "history.json",
+                                                     "latest.pt", "metrics.json"]
+    m, expected = read(run / "metrics.json"), read(tmp_path / "ref/massachusetts_R1_s0/metrics.json")
+    assert m["resumes"] == 0 and m["history"] and m["threshold"] == expected["threshold"]
+    assert [(r["epoch"], r["val_iou"], r["lr"]) for r in m["history"]] == [
+        (r["epoch"], r["val_iou"], r["lr"]) for r in expected["history"]]
+    assert weights_digest(run / "best.pt") == weights_digest(
+        tmp_path / "ref/massachusetts_R1_s0/best.pt")           # undisturbed by the intruders
+    r = subprocess.run(cmd(0), capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0 and "already complete" in r.stdout  # lock released on normal exit
 
 
 @pytest.mark.slow

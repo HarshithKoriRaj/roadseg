@@ -62,7 +62,8 @@ from .eval import evaluate, resolve_device, select_threshold
 from .losses import ComboLoss
 from .models.segmenter import build_model
 from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
-                      EXIT_REQUEUE, PreflightFailed, Refused, run_cli)
+                      EXIT_REQUEUE, PreflightFailed, Refused, RunLock, clear_stale_temps,
+                      run_cli, tmp_name)
 
 PROJECT = Path(__file__).resolve().parents[2]
 RUNGS = ("R0", "R1", "R2", "R3")
@@ -343,7 +344,7 @@ def stop_workers(loader) -> None:
 def write_json_atomic(path, obj) -> None:
     """Temp file, flush + fsync, atomic rename: readers see the old file or the new one."""
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = tmp_name(path)
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
         f.flush()
@@ -355,9 +356,7 @@ def publish_json_once(path, obj) -> bool:
     """Like write_json_atomic, but never replaces an existing file (hard link, which
     fails if the target exists). Returns False if `path` was already there."""
     path = Path(path)
-    for stale in path.parent.glob(f".{path.name}.*.tmp"):     # left by a killed writer
-        stale.unlink(missing_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = tmp_name(path)
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
         f.flush()
@@ -617,19 +616,9 @@ def main(argv=None) -> int:
     cfg = resolve_config(args, error=ap.error)
     run = Path(cfg["runs_dir"]) / run_name(cfg)
     device = resolve_device(args.device)       # an explicit cuda never falls back to the CPU
-    is_cuda = str(device).startswith("cuda")
     use_amp = bool(cfg["amp"])
     print(f"rung={cfg['rung'] or '-'} seed={cfg['seed']} dataset={cfg['dataset']} "
           f"model={cfg['model']} device={device} amp={use_amp} run={run}", flush=True)
-
-    if not args.dry_run and (run / "metrics.json").exists():
-        done = json.loads((run / "metrics.json").read_text())
-        diff = config_diff(done.get("cfg", {}), cfg)
-        if diff:
-            raise Refused(f"refusing: {run / 'metrics.json'} exists for a different "
-                             f"configuration ({'; '.join(diff)})")
-        print(f"already complete: {run / 'metrics.json'} exists; nothing to do", flush=True)
-        return 0
 
     def build():
         set_seed(cfg["seed"])                  # immediately before build_model, nothing between
@@ -639,7 +628,7 @@ def main(argv=None) -> int:
                                       weight_decay=cfg["weight_decay"])
         return model, loss_fn, optimizer
 
-    if args.dry_run:
+    if args.dry_run:                           # touches nothing on disk: no lock, no directory
         model, loss_fn, optimizer = build()
         steps = cfg["max_train_batches"] or 100              # nominal: no data is read
         scheduler = build_scheduler(optimizer, round(cfg["warmup_epochs"] * steps),
@@ -649,7 +638,32 @@ def main(argv=None) -> int:
               f"(use_cldice={loss_fn.use_cldice}), {type(optimizer).__name__} "
               f"lr={cfg['lr']} wd={cfg['weight_decay']}, {type(scheduler).__name__} "
               f"warmup_epochs={cfg['warmup_epochs']} epochs={cfg['epochs']}", flush=True)
-        return 0
+        return EXIT_OK
+
+    # One writer per run directory, from before any state is read until the process ends
+    # (the kernel drops the lock on any exit, SIGKILL included). Refused -> exit code 2.
+    lock = RunLock(run).acquire()
+    try:
+        # Under the lock every temp file is the debris of a dead process: a half-written
+        # checkpoint is never read, but it is 300 MB.
+        clear_stale_temps(run)
+        return _train(args, cfg, run, device, build)
+    finally:
+        lock.release()
+
+
+def _train(args, cfg: dict, run: Path, device: str, build) -> int:
+    """Everything `main` does to the run directory. The caller holds the run's lock."""
+    is_cuda = str(device).startswith("cuda")
+    use_amp = bool(cfg["amp"])
+    if (run / "metrics.json").exists():
+        done = json.loads((run / "metrics.json").read_text())
+        diff = config_diff(done.get("cfg", {}), cfg)
+        if diff:
+            raise Refused(f"refusing: {run / 'metrics.json'} exists for a different "
+                          f"configuration ({'; '.join(diff)})")
+        print(f"already complete: {run / 'metrics.json'} exists; nothing to do", flush=True)
+        return EXIT_OK
 
     resume = None
     if args.resume == "auto":
@@ -685,9 +699,6 @@ def main(argv=None) -> int:
         if is_cuda:
             torch.backends.cudnn.benchmark = True
 
-        run.mkdir(parents=True, exist_ok=True)
-        for torn in run.glob("*.tmp"):         # half-written checkpoint of a killed process;
-            torn.unlink(missing_ok=True)       # never read, but 300 MB each
         if resume is not None:
             state = load_state(resume, model, optimizer, scheduler, cfg, steps_per_epoch,
                                map_location=device)

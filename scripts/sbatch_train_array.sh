@@ -189,7 +189,8 @@ elif (( STEP_RC != 0 )); then
 fi
 
 # ---- 2. score the test split, once -------------------------------------------------------
-rm -f "$RUN"/.test_metrics.json.*.tmp       # left behind if an earlier scoring was killed
+# (Temp files of an earlier, killed scoring are cleared by roadseg.eval itself, under the
+# run's lock -- a blind rm here could delete the temp file of a scorer that is still alive.)
 run_step "$PY" -m roadseg.eval --run "$RUN" --split test --workers 8 --device cuda
 echo "eval exited with $STEP_RC"
 if (( STEP_RC == 0 )); then

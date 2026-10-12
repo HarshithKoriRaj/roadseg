@@ -14,6 +14,8 @@ from pathlib import Path
 
 import torch
 
+from .runtime import tmp_name
+
 
 def save_checkpoint(path, model, optimizer=None, scheduler=None, *,
                     epoch: int = 0, best: float = 0.0, cfg: dict | None = None,
@@ -32,7 +34,7 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, *,
         payload["optimizer"] = optimizer.state_dict()
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
-    tmp = path.with_suffix(".tmp")
+    tmp = tmp_name(path)       # .<name>.<host>.<pid>.tmp: never shared with another process
     with open(tmp, "wb") as f:
         torch.save(payload, f)
         f.flush()

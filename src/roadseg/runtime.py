@@ -21,10 +21,15 @@ Only 75 is ever requeued. 1, 2 and 3 would fail the same way again.
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import multiprocessing
 import os
+import socket
 import sys
+import time
 import traceback
+from pathlib import Path
 
 EXIT_OK = 0
 EXIT_CRASHED = 1
@@ -39,6 +44,90 @@ class Refused(SystemExit):
 
 class PreflightFailed(SystemExit):
     """Raised with a message when the GPU cannot run this job (exit code EXIT_PREFLIGHT)."""
+
+
+def tmp_name(path) -> Path:
+    """`.<name>.<hostname>.<pid>.tmp` beside `path`: the temp file THIS process writes
+    before renaming it to `path`. Unique per process, so two writers can never share an
+    inode, and a leftover names the (dead) process it belonged to."""
+    path = Path(path)
+    return path.with_name(f".{path.name}.{socket.gethostname()}.{os.getpid()}.tmp")
+
+
+_HELD: set[str] = set()                # lock files this process holds (see RunLock.acquire)
+
+
+class RunLock:
+    """Exclusive lock on a run directory: `<run>/.lock`, held for the life of the process.
+
+    POSIX record lock (`fcntl.lockf`), non-blocking. It works on NFS 4.1 (/scratch),
+    belongs to the process -- forked DataLoader workers do not share it -- and the
+    kernel drops it when the process ends in any way, SIGKILL included, so there is
+    no stale lock to clean up. The file itself is never removed (unlinking a lock
+    file lets two processes each lock a different inode of the same name).
+    """
+
+    def __init__(self, run) -> None:
+        self.run = Path(run)
+        self.path = self.run / ".lock"
+        self.fd: int | None = None
+
+    def acquire(self) -> "RunLock":
+        """Take the lock or raise Refused (exit code 2) naming the run and the holder."""
+        self.run.mkdir(parents=True, exist_ok=True)
+        key = os.path.realpath(self.path)
+        # POSIX locks never conflict inside one process, and closing ANY descriptor of the
+        # file drops them all -- so a second holder in this process must be refused here.
+        if key in _HELD:
+            raise Refused(f"run directory {self.run} is locked by this very process")
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            try:
+                holder = os.pread(fd, 300, 0).decode(errors="replace").strip()
+            except OSError:
+                holder = ""
+            os.close(fd)
+            if e.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            raise Refused(f"run directory {self.run} is locked by another process "
+                          f"({holder or 'holder unknown'}). Two processes writing one run "
+                          f"would corrupt it; not starting.") from None
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{socket.gethostname()} pid {os.getpid()} since "
+                      f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode(), 0)
+        self.fd = fd
+        _HELD.add(key)
+        return self
+
+    def release(self) -> None:
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        _HELD.discard(os.path.realpath(self.path))
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self) -> "RunLock":
+        return self if self.fd is not None else self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def clear_stale_temps(run) -> list[str]:
+    """Remove every `*.tmp` in `run`. ONLY call while holding the run's lock: then no
+    live process is writing there, and each temp file is the debris of a killed one
+    (never read by anything, but 300 MB apiece for a checkpoint)."""
+    removed = []
+    for p in Path(run).iterdir():
+        if p.name.endswith(".tmp") and not p.is_dir():
+            p.unlink(missing_ok=True)
+            removed.append(p.name)
+    return sorted(removed)
 
 
 def kill_children(timeout: float = 10.0) -> int:

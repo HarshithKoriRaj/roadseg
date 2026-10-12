@@ -30,7 +30,7 @@ from .engine import load_checkpoint
 from .image_metrics import image_metrics
 from .metrics import confusion, metrics_from_confusion
 from .models.segmenter import build_model
-from .runtime import PreflightFailed, run_cli
+from .runtime import PreflightFailed, RunLock, clear_stale_temps, run_cli, tmp_name
 
 _COUNTS = ("tp", "fp", "fn", "tn")
 _ROW_NONMETRIC = ("id", "n_valid", "tp", "fp", "fn", "n_gt", "n_pred")
@@ -243,6 +243,18 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     run = Path(a.run)
+    device = resolve_device(a.device)              # before anything is read or written
+    if not run.is_dir():
+        raise FileNotFoundError(f"no run directory {run} (expected {run / 'metrics.json'})")
+    # The same exclusive lock as roadseg.train: scoring never overlaps a process that is
+    # still writing the run, nor a second scorer. Refused -> exit code 2.
+    with RunLock(run):
+        clear_stale_temps(run)                     # under the lock: debris of dead processes
+        return _score(a, run, device)
+
+
+def _score(a, run: Path, device: str) -> int:
+    """Score and publish. The caller holds the run's lock."""
     out_path = run / f"{a.split}_metrics.json"
     guard = a.split == "test"
     # The test set is scored once: refuse BEFORE doing any work.
@@ -251,7 +263,6 @@ def main(argv=None) -> int:
               f"pass --force to re-score (the old file is kept as .superseded.json).",
               file=sys.stderr)
         return 2
-    device = resolve_device(a.device)              # before anything is read or written
 
     meta = json.loads((run / "metrics.json").read_text())
     cfg, threshold = meta["cfg"], float(meta["threshold"])
@@ -278,7 +289,7 @@ def main(argv=None) -> int:
     payload = {"cfg": cfg, "threshold": threshold, "split": a.split,
                "protocol": "standard" if standard else "nonstandard", "eval": ev,
                "aggregate": agg, "per_image": rows}
-    tmp = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+    tmp = tmp_name(out_path)                                   # .<name>.<host>.<pid>.tmp
     with open(tmp, "x") as f:                                  # exclusive create
         json.dump(payload, f, indent=2)
         f.flush(); os.fsync(f.fileno())
