@@ -37,7 +37,7 @@ ENV = dict(os.environ, PYTHONPATH=f"{ROOT}/.deps:{ROOT}/src", OMP_NUM_THREADS="2
            MKL_NUM_THREADS="2", TORCH_HOME="/scratch/hk4488/.cache/torch")
 METRICS_KEYS = {"cfg", "threshold", "val", "per_image", "best_epoch", "best_val_iou", "history",
                 "n_params", "git_commit", "torch_version", "device_name", "hostname",
-                "wall_seconds"}
+                "wall_seconds", "code_commit", "code_dirty", "processes", "code_changes"}
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -652,6 +652,9 @@ def test_end_to_end_writes_everything_once_and_is_idempotent(tiny, capsys):
     assert "apls" in m["per_image"][0] and "cl_dice" in m["per_image"][0]
     assert m["device_name"] == "cpu" and m["torch_version"] == torch.__version__
     assert len(m["git_commit"]) == 40 and m["n_params"] == sum(p.numel() for p in Tiny().parameters())
+    assert m["code_commit"] == m["git_commit"] and m["code_changes"] == []
+    assert [(p["code_commit"], p["first_epoch"], p["last_epoch"], p["device_name"])
+            for p in m["processes"]] == [(m["code_commit"], 0, 2, "cpu")]    # one process did it all
     assert m["resumes"] == 0 and m["steps_per_epoch"] == 4
 
     before = (run / "metrics.json").stat().st_mtime_ns
@@ -887,7 +890,7 @@ def test_kill_at_every_point_then_resume_reaches_the_uninterrupted_result(tiny, 
         """Everything but timings and the bookkeeping of the interruption itself, as text
         (so NaN entries compare equal)."""
         m = json.loads(json.dumps(m))
-        for k in ("wall_seconds", "resumes"):
+        for k in ("wall_seconds", "resumes", "processes"):     # one entry per process
             m.pop(k)
         for r in m["history"]:
             for k in ("seconds", "train_loss", "resumed", "train_steps"):
@@ -1009,6 +1012,7 @@ def test_best_pt_is_repaired_when_killed_between_latest_and_best(tiny, monkeypat
 # ----------------------------------------------------------------------------- SLURM scripts
 
 ARRAY = ROOT / "scripts" / "sbatch_train_array.sh"
+PROJECT = "/scratch/hk4488/roadseg"        # hard-coded in the scripts: data, .deps, runs, logs
 
 
 def _print_map():
@@ -1086,6 +1090,8 @@ def note(msg):
         f.write(msg + "\n")
 note(mod + " argv " + " ".join(sys.argv[1:]))
 s = spec.get(mod, {{}})
+if "env" in s:
+    note(mod + " env " + " ".join(os.environ.get(k, "<unset>") for k in s["env"]))
 if "touch" in s:
     run = sys.argv[sys.argv.index("--run") + 1]
     open(os.path.join(run, s["touch"]), "w").write("{{}}")
@@ -1145,14 +1151,307 @@ def test_wrapper_runs_train_then_scores_the_test_split(tmp_path):
     assert rc == 0, out
     run = tmp_path / "runs" / "massachusetts_R1_s1"
     assert log == [                                    # G3: both steps name the GPU explicitly
-        f"train argv -m roadseg.train --config configs/massachusetts.yaml --rung R1 --seed 1 "
-        f"--resume auto --runs-dir {tmp_path / 'runs'} --device cuda",
+        f"train argv -m roadseg.train --config {PROJECT}/configs/massachusetts.yaml --rung R1 "
+        f"--seed 1 --resume auto --runs-dir {tmp_path / 'runs'} --device cuda",
         f"eval argv -m roadseg.eval --run {run} --split test --workers 8 --device cuda"]
     assert "task 4 -> dataset=massachusetts name=R1 seed=1" in out
+    assert "WARNING: the LIVE tree, not a snapshot" in out          # no ROADSEG_CODE: say so
     rc, log, out = _wrapper(tmp_path, {}, task=33)                 # a baseline uses --model
     assert rc == 0, out
-    assert "--config configs/deepglobe.yaml --model dlinknet --seed 0" in log[0]
+    assert f"--config {PROJECT}/configs/deepglobe.yaml --model dlinknet --seed 0" in log[0]
     assert log[1].startswith(f"eval argv -m roadseg.eval --run {tmp_path / 'runs'}/deepglobe_dlinknet_s0 ")
+
+
+def test_wrapper_takes_code_and_configs_from_the_frozen_snapshot(tmp_path):
+    """G5. With ROADSEG_CODE (exported by launch.sh) python imports the snapshot's src and
+    reads the snapshot's configs; .deps, runs and logs stay under the project."""
+    snap = tmp_path / "releases" / "abc1234"
+    (snap / "src" / "roadseg").mkdir(parents=True)
+    (snap / "configs").mkdir()
+    (snap / "configs" / "massachusetts.yaml").write_text("dataset: massachusetts\n")
+    (snap / "COMMIT").write_text("a" * 40 + "\n")
+    spec = {"train": {"env": ["PYTHONPATH", "ROADSEG_CODE"]}, "eval": {"env": ["PYTHONPATH"]}}
+    rc, log, out = _wrapper(tmp_path, spec, env_extra={"ROADSEG_CODE": str(snap)})
+    assert rc == 0, out
+    assert f"--config {snap}/configs/massachusetts.yaml --rung R1" in log[0]
+    assert log[1] == f"train env {PROJECT}/.deps:{snap}/src {snap}"
+    assert log[3] == f"eval env {PROJECT}/.deps:{snap}/src"
+    assert f"code {snap}  commit {'a' * 40} (frozen snapshot)" in out and "WARNING" not in out
+    # a snapshot that is not there must stop the task before python starts
+    rc, log, out = _wrapper(tmp_path, {}, env_extra={"ROADSEG_CODE": str(tmp_path / "gone")})
+    assert rc == 2 and log == [] and "no code at ROADSEG_CODE" in out, out
+
+
+# ----------------------------------------------------------------------------- G5: code identity
+
+SHA_A, SHA_B = "a" * 40, "b" * 40
+
+
+def _as_snapshot(monkeypatch, root, sha):
+    """Make train.py find itself in a frozen snapshot at `root` holding commit `sha`."""
+    root.mkdir(exist_ok=True)
+    (root / "COMMIT").write_text(sha + "\n")
+    monkeypatch.setattr(tr, "PROJECT", root)
+
+
+def test_code_identity_comes_from_the_commit_file_or_from_git(tmp_path, monkeypatch):
+    monkeypatch.delenv("ROADSEG_CODE", raising=False)
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "COMMIT").write_text(SHA_A + "\n")
+    assert tr.code_identity(snap) == {"commit": SHA_A, "dirty": False,
+                                      "source": str(snap / "COMMIT")}
+    monkeypatch.setenv("ROADSEG_CODE", str(snap))                  # as launch.sh exports it
+    assert tr.code_identity(snap)["commit"] == SHA_A
+    monkeypatch.setenv("ROADSEG_CODE", str(tmp_path / "elsewhere"))
+    with pytest.raises(tr.Refused, match="ROADSEG_CODE=.*imported from"):
+        tr.code_identity(snap)                                     # recording one, running another
+    monkeypatch.delenv("ROADSEG_CODE")
+    (snap / "COMMIT").write_text("HEAD\n")
+    with pytest.raises(tr.Refused, match="full commit sha"):
+        tr.code_identity(snap)
+
+    repo, sha, _ = _launch_repo(tmp_path)                          # a working tree
+    assert tr.code_identity(repo) == {"commit": sha, "dirty": False, "source": "git"}
+    (repo / "src" / "roadseg" / "new.py").write_text("x = 1\n")    # untracked code counts
+    assert tr.code_identity(repo) == {"commit": sha, "dirty": True, "source": "git"}
+    inner = repo / "releases" / "broken"                           # ignored dir inside the repo,
+    inner.mkdir(parents=True)                                      # no COMMIT: NOT the repo's HEAD
+    assert tr.code_identity(inner) == {"commit": "unknown", "dirty": None, "source": "none"}
+    assert tr.code_identity(tmp_path / "snap" / "..")["commit"] == "unknown"   # no git at all
+
+    here = tr.code_identity()                                      # this checkout
+    assert len(here["commit"]) == 40 and here["source"] == "git" and here["dirty"] in (True, False)
+    a, b = {"commit": SHA_A, "dirty": False, "source": "x"}, {"commit": SHA_A, "dirty": False,
+                                                              "source": "git"}
+    assert tr.same_code(a, b) and not tr.same_code(a, {**b, "commit": SHA_B})
+    assert not tr.same_code(a, {**b, "dirty": True}) and not tr.same_code(None, a)
+
+
+def _preempt_at_step(monkeypatch, n):
+    """SIGTERM this process during the n-th optimizer step (1-based) of the next main()."""
+    real, calls = tr.ComboLoss, []
+
+    class Loss(real):
+        def forward(self, *a):
+            calls.append(1)
+            if len(calls) == n:
+                os.kill(os.getpid(), signal.SIGTERM)
+            return super().forward(*a)
+
+    monkeypatch.setattr(tr, "ComboLoss", Loss)
+    return calls
+
+
+def test_resume_with_changed_code_is_refused_and_allowed_only_explicitly(tiny, monkeypatch, capsys):
+    """G5. Every checkpoint carries the identity of the code that wrote it; a resume under
+    different code exits 'refused' showing both, unless --allow-code-change, which records
+    both. metrics.json lists every process that worked on the run."""
+    snap = tiny.root / "snap"
+    _as_snapshot(monkeypatch, snap, SHA_A)
+    _preempt_at_step(monkeypatch, 6)                               # epoch 1, step 2
+    assert tiny.train() == 75
+    assert f"code={SHA_A[:12]}" in capsys.readouterr().out
+    run = tiny.runs / "massachusetts_R1_s0"
+    extra = torch.load(run / "latest.pt", map_location="cpu", weights_only=False)["extra"]
+    assert extra["code"] == {"commit": SHA_A, "dirty": False, "source": str(snap / "COMMIT")}
+    assert [(p["code_commit"], p["first_epoch"], p["last_epoch"]) for p in extra["processes"]] == [
+        (SHA_A, 0, 1)]
+    latest = (run / "latest.pt").read_bytes()
+
+    _as_snapshot(monkeypatch, snap, SHA_B)                         # the code moved on
+    with pytest.raises(tr.Refused, match=f"code changed.*{SHA_A}.*{SHA_B}.*--allow-code-change"):
+        tiny.train("--resume", "auto")
+    assert (run / "latest.pt").read_bytes() == latest and not (run / "metrics.json").exists()
+
+    assert tiny.train("--resume", "auto", "--allow-code-change") == 0
+    assert "code changed" in capsys.readouterr().out               # said so, loudly
+    m = read(run / "metrics.json")
+    assert (m["code_commit"], m["code_dirty"], m["git_commit"]) == (SHA_B, False, SHA_B)
+    assert [(p["code_commit"], p["code_dirty"], p["first_epoch"], p["last_epoch"])
+            for p in m["processes"]] == [(SHA_A, False, 0, 1), (SHA_B, False, 1, 2)]
+    assert all(p["hostname"] == socket.gethostname() and p["device_name"] == "cpu"
+               and p["started"] and p["pid"] == os.getpid() for p in m["processes"])
+    assert m["code_changes"] == [{"epoch": 1, "step_in_epoch": 2, "from": extra["code"],
+                                  "to": {"commit": SHA_B, "dirty": False,
+                                         "source": str(snap / "COMMIT")}}]
+    assert m["resumes"] == 1 and [r["epoch"] for r in m["history"]] == [0, 1, 2]
+
+
+def test_an_unchanged_snapshot_resumes_and_one_process_is_one_entry(tiny, monkeypatch, capsys):
+    _as_snapshot(monkeypatch, tiny.root / "snap", SHA_A)
+    calls = _preempt_at_step(monkeypatch, 12)                      # during the very last step
+    assert tiny.train() == 75
+    assert tiny.train("--resume", "auto") == 0                     # same COMMIT: no flag needed
+    assert len(calls) == 12
+    m = read(tiny.runs / "massachusetts_R1_s0" / "metrics.json")
+    assert m["code_changes"] == [] and m["code_commit"] == SHA_A
+    # the second process only validated epoch 2 and ran the finish phase
+    assert [(p["first_epoch"], p["last_epoch"]) for p in m["processes"]] == [(0, 2), (2, 2)]
+
+    _as_snapshot(monkeypatch, tiny.root / "snap", SHA_B)           # "already complete" is not a
+    assert tiny.train("--resume", "auto") == 0                     # resume: nothing is computed
+    assert "already complete" in capsys.readouterr().out
+
+
+def test_a_checkpoint_without_a_code_identity_is_not_resumed_silently(tiny, monkeypatch):
+    _preempt_at_step(monkeypatch, 6)
+    assert tiny.train() == 75
+    latest = tiny.runs / "massachusetts_R1_s0" / "latest.pt"
+    ck = torch.load(latest, map_location="cpu", weights_only=False)
+    for key in ("code", "processes", "code_changes"):              # as written before G5
+        del ck["extra"][key]
+    torch.save(ck, latest)
+    with pytest.raises(tr.Refused, match="code changed.*<not recorded>"):
+        tiny.train("--resume", "auto")
+    assert tiny.train("--resume", "auto", "--allow-code-change") == 0
+    m = read(latest.parent / "metrics.json")
+    assert m["code_changes"][0]["from"] is None and len(m["processes"]) == 1
+
+
+# ----------------------------------------------------------------------------- G5: launch.sh
+
+LAUNCH = ROOT / "scripts" / "launch.sh"
+FAKE_SBATCH = '''#!/bin/bash
+# records its arguments and the ROADSEG_* variables it was given; answers with a job id
+n=$(( $(cat "$FAKE_SBATCH_LOG" 2>/dev/null | grep -c '^sbatch') + 1 ))
+echo "sbatch $*" >> "$FAKE_SBATCH_LOG"
+echo "env PY=${ROADSEG_PY-<unset>} RUNS=${ROADSEG_RUNS-<unset>} LOGS=${ROADSEG_LOGS-<unset>}" >> "$FAKE_SBATCH_LOG"
+echo "$(( 9000 + n ));torch"
+'''
+
+
+def _git(repo, *args):
+    r = subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t.t",
+                        *args], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _launch_repo(tmp_path):
+    """A small committed repository standing in for the project, and a fake sbatch."""
+    repo = tmp_path / "project"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "src" / "roadseg").mkdir(parents=True)
+    for name in ("sbatch_train_array.sh", "sbatch_aggregate.sh", "sbatch_canary.sh"):
+        (repo / "scripts" / name).write_text(f"#!/bin/bash\necho {name}\n")
+    (repo / "src" / "roadseg" / "train.py").write_text("VERSION = 1\n")
+    (repo / ".gitignore").write_text("releases/\nruns/\nruns_smoke/\n")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "first")
+    sbatch = tmp_path / "fake_sbatch"
+    sbatch.write_text(FAKE_SBATCH)
+    sbatch.chmod(0o755)
+    return repo, _git(repo, "rev-parse", "HEAD"), _git(repo, "rev-parse", "--short", "HEAD")
+
+
+def _launch(tmp_path, repo, *args, smoke=None, env_extra=None):
+    """Run the REAL launch.sh against the stand-in repository. `smoke` is the content of the
+    rehearsal's acknowledgement file (None: no file)."""
+    flag = repo / "runs_smoke" / "SMOKE_PASSED"
+    flag.parent.mkdir(exist_ok=True)
+    flag.unlink(missing_ok=True)
+    if smoke is not None:
+        flag.write_text(smoke + "\n")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "ROADSEG_PROJECT": str(repo),
+           "ROADSEG_SBATCH": str(tmp_path / "fake_sbatch"),
+           "ROADSEG_SLURM_LOGS": str(tmp_path / "slurm_logs"),
+           "FAKE_SBATCH_LOG": str(tmp_path / "sbatch.log"),
+           "ROADSEG_PY": "/test/python", "ROADSEG_RUNS": "/test/runs", "ROADSEG_LOGS": "/test/logs",
+           **(env_extra or {})}
+    r = subprocess.run(["bash", str(LAUNCH), *args], capture_output=True, text=True, env=env)
+    log = tmp_path / "sbatch.log"
+    return r.returncode, r.stdout, r.stderr, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_launch_dry_run_prints_the_plan_and_creates_nothing(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    def listing():                       # (runs_smoke/SMOKE_PASSED is put there by _launch)
+        return sorted(str(p) for p in tmp_path.rglob("*")
+                      if not {".git", "runs_smoke"} & set(p.parts))
+
+    before = listing()
+    rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", smoke=sha)
+    assert rc == 0, out + err
+    snap = repo / "releases" / short
+    assert f"snapshot: {snap} (would be created" in out and "DRY RUN" in out
+    export = f"--export=ALL,ROADSEG_CODE={snap}"
+    assert f"would run: {tmp_path / 'fake_sbatch'} --parsable {export} {snap}/scripts/sbatch_train_array.sh" in out
+    assert (f"would run: {tmp_path / 'fake_sbatch'} --parsable --dependency=afterany:<array job id> "
+            f"{export} {snap}/scripts/sbatch_aggregate.sh") in out
+    assert calls == []                                               # nothing submitted
+    assert listing() == before                # no snapshot, no LAUNCHES.log, no log directory
+    rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", "--canary", smoke=sha)
+    assert rc == 0 and calls == [] and out.count("would run:") == 1
+    assert f"{export} {snap}/scripts/sbatch_canary.sh" in out
+
+
+def test_launch_refuses_a_dirty_tree(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    (repo / "src" / "roadseg" / "train.py").write_text("VERSION = 2\n")      # modified, tracked
+    for args in (("--dry-run",), ()):
+        rc, out, err, calls = _launch(tmp_path, repo, *args, smoke=sha)
+        assert rc == 2 and calls == [], out + err
+        assert "REFUSED" in err and "dirty" in err and "src/roadseg/train.py" in err
+    _git(repo, "checkout", "-q", "--", ".")
+    (repo / "src" / "roadseg" / "new_module.py").write_text("x = 1\n")       # untracked code
+    rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", smoke=sha)
+    assert rc == 2 and "new_module.py" in err
+    assert not (repo / "releases").exists() and not (repo / "runs").exists()
+
+
+def test_launch_requires_the_cpu_rehearsal_to_have_passed_at_this_commit(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    rc, out, err, calls = _launch(tmp_path, repo, smoke=None)
+    assert rc == 2 and calls == [] and "REFUSED" in err and "SMOKE_PASSED" in err, out + err
+    rc, out, err, calls = _launch(tmp_path, repo, smoke="b" * 40)            # another commit
+    assert rc == 2 and calls == [] and "b" * 40 in err and sha in err, out + err
+    assert not (repo / "releases").exists()
+    rc, out, err, calls = _launch(tmp_path, repo, "--no-smoke-check", "--dry-run", smoke=None)
+    assert rc == 0 and "WARNING --no-smoke-check" in err and "WITHOUT a passed CPU rehearsal" in err
+    rc, out, err, calls = _launch(tmp_path, repo, "--bogus", smoke=sha)
+    assert rc == 2 and calls == [] and "unknown argument" in err
+
+
+def test_launch_freezes_a_snapshot_and_submits_from_it(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    rc, out, err, calls = _launch(tmp_path, repo, smoke=sha)
+    assert rc == 0, out + err
+    snap = repo / "releases" / short
+    assert (snap / "COMMIT").read_text().strip() == sha
+    assert (snap / "src/roadseg/train.py").read_text() == "VERSION = 1\n"
+    assert sorted(p.name for p in snap.iterdir()) == [".gitignore", "COMMIT", "scripts", "src"]
+    assert not os.access(snap / "src/roadseg/train.py", os.W_OK)             # frozen
+    export = f"--export=ALL,ROADSEG_CODE={snap}"
+    assert calls == [
+        f"sbatch --parsable {export} {snap}/scripts/sbatch_train_array.sh",
+        "env PY=<unset> RUNS=<unset> LOGS=<unset>",                 # test overrides do not leak
+        f"sbatch --parsable --dependency=afterany:9001 {export} {snap}/scripts/sbatch_aggregate.sh",
+        "env PY=<unset> RUNS=<unset> LOGS=<unset>"]
+    assert "array job: 9001" in out and "aggregate job: 9002" in out and str(snap) in out
+    line = (repo / "runs" / "LAUNCHES.log").read_text().splitlines()
+    assert len(line) == 1 and line[0].endswith(f"sha={sha} snapshot={snap} array=9001 aggregate=9002")
+    assert (tmp_path / "slurm_logs").is_dir()
+    assert _git(repo, "status", "--porcelain") == ""                # launching leaves it clean
+
+    # the live tree moves on; the snapshot does not, and a relaunch of the old commit reuses it
+    (repo / "src" / "roadseg" / "train.py").write_text("VERSION = 2\n")
+    _git(repo, "commit", "-q", "-am", "second")
+    assert (snap / "src/roadseg/train.py").read_text() == "VERSION = 1\n"
+    _git(repo, "checkout", "-q", sha)
+    rc, out, err, calls = _launch(tmp_path, repo, "--canary", smoke=sha)
+    assert rc == 0 and "already there" in out, out + err
+    assert calls[-2] == f"sbatch --parsable {export} {snap}/scripts/sbatch_canary.sh"
+    assert len(calls) == 6                                           # the canary only
+    log = (repo / "runs" / "LAUNCHES.log").read_text().splitlines()
+    assert len(log) == 2 and log[1].endswith(f"snapshot={snap} canary=9003")
+    # a snapshot directory that holds something else is never reused
+    os.chmod(snap, 0o755)
+    os.chmod(snap / "COMMIT", 0o644)
+    (snap / "COMMIT").write_text("c" * 40 + "\n")
+    rc, out, err, calls = _launch(tmp_path, repo, smoke=sha)
+    assert rc == 2 and "REFUSED" in err and len(calls) == 6
 
 
 def _requeues(log):

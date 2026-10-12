@@ -23,13 +23,16 @@
 set -uo pipefail
 
 PROJECT=/scratch/hk4488/roadseg
+CODE="${ROADSEG_CODE:-$PROJECT}"        # the frozen snapshot of scripts/launch.sh; default: live tree
 PY="${ROADSEG_PY:-/scratch/hk4488/.conda/envs/unsloth_sft/bin/python}"
 RUNS="${ROADSEG_RUNS:-$PROJECT/runs}"
-export PYTHONPATH="$PROJECT/.deps:$PROJECT/src"
+export ROADSEG_CODE="$CODE"
+export PYTHONPATH="$PROJECT/.deps:$CODE/src"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
 cd "$PROJECT"
-echo "host $(hostname)  commit $(git rev-parse --short HEAD)  runs $RUNS  $(date)"
+commit=$(cat "$CODE/COMMIT" 2>/dev/null || git -C "$CODE" rev-parse HEAD 2>/dev/null || echo unknown)
+echo "host $(hostname)  code $CODE  commit $commit  runs $RUNS  $(date)"
 echo "finished runs: $(ls "$RUNS"/*/test_metrics.json 2>/dev/null | wc -l) of 36"
 
 status=0

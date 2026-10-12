@@ -17,10 +17,12 @@
 #
 # One array task = one run: train, then score the test split once.
 #
-#   mkdir -p /scratch/hk4488/logs/roadseg        # SLURM does not create the log directory
-#   sbatch scripts/sbatch_train_array.sh         # all 36 runs, at most 16 at a time
-#   sbatch --array=0-23%16 scripts/sbatch_train_array.sh    # the ablation ladder only
+#   bash scripts/launch.sh                       # THE way to submit: all 36 runs, at most 16
+#                                                # at a time, from a frozen snapshot of HEAD
 #   bash scripts/sbatch_train_array.sh --print-map          # show the mapping; touches nothing
+#
+# Do not sbatch this file by hand: without ROADSEG_CODE (set by launch.sh) each requeue would
+# import whatever the live repository holds at that moment.
 #
 # Index -> run (seed is the fastest index):
 #
@@ -54,6 +56,11 @@
 set -euo pipefail
 
 PROJECT=/scratch/hk4488/roadseg
+# Code and configs come from $ROADSEG_CODE: the frozen snapshot that scripts/launch.sh creates
+# and exports, so every requeue of every task imports the same commit. Data, .deps, runs and
+# logs stay under the project directory. (sbatch copied this script at submit time, so its
+# own logic is frozen too.) Default: the live tree -- for tests and rehearsals only.
+CODE="${ROADSEG_CODE:-$PROJECT}"
 PY="${ROADSEG_PY:-/scratch/hk4488/.conda/envs/unsloth_sft/bin/python}"
 RUNS="${ROADSEG_RUNS:-$PROJECT/runs}"
 LOGS="${ROADSEG_LOGS:-/scratch/hk4488/logs/roadseg}"
@@ -96,13 +103,24 @@ map_index "${SLURM_ARRAY_TASK_ID:?run as an array task (or use --print-map)}"
 RUN="$RUNS/${DATASET}_${NAME}_s${SEED}"
 mkdir -p "$LOGS" "$RUNS"
 
-export PYTHONPATH="$PROJECT/.deps:$PROJECT/src"
+if [[ ! -d "$CODE/src/roadseg" || ! -f "$CODE/configs/${DATASET}.yaml" ]]; then
+    echo "no code at ROADSEG_CODE=$CODE (src/roadseg, configs/${DATASET}.yaml): not started" >&2
+    exit 2
+fi
+export ROADSEG_CODE="$CODE"
+export PYTHONPATH="$PROJECT/.deps:$CODE/src"
 export TORCH_HOME=/scratch/hk4488/.cache/torch
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=1
 
 echo "task $SLURM_ARRAY_TASK_ID -> dataset=$DATASET name=$NAME seed=$SEED run=$RUN"
 echo "host $(hostname)  job ${SLURM_JOB_ID:-?}  restart ${SLURM_RESTART_COUNT:-0}  $(date)"
+if [[ -f "$CODE/COMMIT" ]]; then
+    echo "code $CODE  commit $(cat "$CODE/COMMIT") (frozen snapshot)"
+else
+    echo "code $CODE  commit $(git -C "$CODE" rev-parse HEAD 2>/dev/null || echo unknown)" \
+         "- WARNING: the LIVE tree, not a snapshot; submit with scripts/launch.sh"
+fi
 nvidia-smi -L || true
 
 # ---- signal forwarding -------------------------------------------------------------------
@@ -170,7 +188,7 @@ terminated() {
 cd "$PROJECT"
 
 # ---- 1. train ----------------------------------------------------------------------------
-run_step "$PY" -m roadseg.train --config "configs/${DATASET}.yaml" "${SELECT[@]}" \
+run_step "$PY" -m roadseg.train --config "$CODE/configs/${DATASET}.yaml" "${SELECT[@]}" \
     --seed "$SEED" --resume auto --runs-dir "$RUNS" --device cuda
 echo "train exited with $STEP_RC"
 if (( got_term )); then

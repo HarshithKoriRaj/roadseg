@@ -26,11 +26,18 @@ Guarantees the experiment relies on:
   are SIGKILLed on every exit path of `main` (stop_workers), and the CLI ends in
   `os._exit` (runtime.run_cli): a crash fails the job at once instead of hanging.
 
+* One writer, one code. The run directory is locked (<run>/.lock) for the life of
+  the process, and every temp file is named for its process. The identity of the
+  code (the COMMIT file of a frozen snapshot, else git HEAD + dirty flag) is fixed
+  at startup, stored in every checkpoint, and a resume under different code is
+  refused unless --allow-code-change; metrics.json lists every process of the run.
+
 Exit codes (defined in roadseg/runtime.py; the SLURM wrapper acts on them):
 
     0   EXIT_OK         done, or the run was already complete
     75  EXIT_REQUEUE    interrupted by SIGTERM/SIGUSR1, checkpoint saved: requeue me
-    2   EXIT_REFUSED    refused: resume with a different configuration, an
+    2   EXIT_REFUSED    refused: resume with a different configuration or different
+                        code, run directory locked by another process, an
                         inconsistent run directory, a missing --resume checkpoint
                         (and argparse's usage error)
     3   EXIT_PREFLIGHT  the GPU is not usable for this run
@@ -46,7 +53,6 @@ import os
 import random
 import signal
 import socket
-import subprocess
 import time
 from pathlib import Path
 
@@ -63,7 +69,7 @@ from .losses import ComboLoss
 from .models.segmenter import build_model
 from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
                       EXIT_REQUEUE, PreflightFailed, Refused, RunLock, clear_stale_temps,
-                      run_cli, tmp_name)
+                      code_identity, describe_code, run_cli, same_code, tmp_name)
 
 PROJECT = Path(__file__).resolve().parents[2]
 RUNGS = ("R0", "R1", "R2", "R3")
@@ -121,6 +127,9 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-preload", action="store_true")
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--no-pretrained", action="store_true")
+    ap.add_argument("--allow-code-change", action="store_true",
+                    help="resume although the code differs from the code that wrote the "
+                         "checkpoint (both identities are recorded in metrics.json)")
     return ap
 
 
@@ -404,7 +413,14 @@ def fresh_state() -> dict:
     """`epoch` is the first epoch that is not complete; `step_in_epoch` the optimizer
     steps of it already taken."""
     return {"epoch": 0, "step_in_epoch": 0, "history": [], "best": -1.0, "best_epoch": None,
-            "wall_seconds": 0.0, "resumes": 0}
+            "wall_seconds": 0.0, "resumes": 0, **fresh_provenance()}
+
+
+def fresh_provenance() -> dict:
+    """`code`: identity of the code that wrote the checkpoint (runtime.code_identity).
+    `processes`: one entry per process that worked on the run. `code_changes`: every
+    resume under different code that --allow-code-change let through."""
+    return {"code": None, "processes": [], "code_changes": []}
 
 
 def save_state(path, model, optimizer, scheduler, cfg: dict, state: dict,
@@ -415,12 +431,15 @@ def save_state(path, model, optimizer, scheduler, cfg: dict, state: dict,
 
 
 def load_state(path, model, optimizer, scheduler, cfg: dict, steps_per_epoch: int,
-               map_location="cpu") -> dict:
+               map_location="cpu", *, code: dict | None = None,
+               allow_code_change: bool = False, log=print) -> dict:
     """Restore model, optimizer, scheduler and the training state from `path`.
 
     Refuses a checkpoint from a different experiment -- checked BEFORE anything is
     loaded: the scheduler state only means something for the same lr, epochs and
-    steps per epoch.
+    steps per epoch. With `code` (this process's identity) it also refuses a
+    checkpoint written by different code, or by code of unrecorded identity:
+    one run, one code. `allow_code_change` lets it through and records both.
     """
     head = torch.load(path, map_location="cpu", weights_only=False)
     extra, old_cfg = head.get("extra", {}), head.get("cfg", {})
@@ -432,11 +451,27 @@ def load_state(path, model, optimizer, scheduler, cfg: dict, steps_per_epoch: in
         diff.append(f"steps_per_epoch: {extra.get('steps_per_epoch')!r} -> {steps_per_epoch!r}")
     if diff:
         raise Refused(f"refusing to resume: {path} was written by a different configuration ("
-                         + "; ".join(diff) + ")")
+                      + "; ".join(diff) + ")")
+    change = None
+    if code is not None and not same_code(extra.get("code"), code):
+        what = (f"the code changed since {path} was written (checkpoint: "
+                f"{describe_code(extra.get('code'))}; now: {describe_code(code)})")
+        if not allow_code_change:
+            raise Refused(f"refusing to resume: {what}. A run must be one code from start to "
+                          f"finish. Start the run again from this code, or pass "
+                          f"--allow-code-change to continue (both are recorded).")
+        log(f"WARNING: {what}; continuing because of --allow-code-change", flush=True)
+        change = {"epoch": extra["epoch"], "step_in_epoch": extra["step_in_epoch"],
+                  "from": extra.get("code"), "to": code}
     load_checkpoint(path, model, optimizer, scheduler, map_location=map_location)
-    state = {k: extra[k] for k in fresh_state()}
+    state = {k: extra[k] for k in fresh_state() if k not in fresh_provenance()}
     state["history"] = list(state["history"])
     state["resumes"] += 1
+    state["processes"] = [dict(p) for p in extra.get("processes", [])]
+    state["code_changes"] = [dict(c) for c in extra.get("code_changes", [])]
+    if change is not None:
+        state["code_changes"].append(change)
+    state["code"] = code if code is not None else extra.get("code")
     return state
 
 
@@ -484,6 +519,9 @@ def fit(*, model, optimizer, scheduler, loss_fn, batches_for, validate, run: Pat
     def save() -> None:
         nonlocal last_save, saved
         state["wall_seconds"] = wall0 + (clock() - t0)
+        if state.get("processes"):          # this process's entry: the last epoch it worked on
+            state["processes"][-1]["last_epoch"] = (
+                state["epoch"] if state["step_in_epoch"] > 0 else max(state["epoch"] - 1, 0))
         save_state(latest, model, optimizer, scheduler, cfg, state, steps_per_epoch)
         last_save, saved = clock(), True
 
@@ -549,35 +587,19 @@ def fit(*, model, optimizer, scheduler, loss_fn, batches_for, validate, run: Pat
             + (f" [resumed at step {start}]" if start > 0 else ""), flush=True)
 
 
-# --------------------------------------------------------------------------- provenance
-
-def _git(*args: str) -> str | None:
-    try:
-        r = subprocess.run(["git", "-C", str(PROJECT), *args], capture_output=True, text=True,
-                           timeout=30)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
-
-
-def git_commit() -> str:
-    return _git("rev-parse", "HEAD") or "unknown"
-
-
-def git_dirty() -> bool | None:
-    """True if tracked files differ from the recorded commit (None if git is unavailable)."""
-    out = _git("status", "--porcelain", "--untracked-files=no")
-    return None if out is None else bool(out)
-
+# --------------------------------------------------------------------------- finish
 
 def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use_amp: bool,
-           eval_workers: int, extra: dict, log=print) -> bool:
+           eval_workers: int, extra: dict, device_name: str = "cpu", log=print) -> bool:
     """Freeze checkpoint and threshold on VALIDATION and publish metrics.json once.
 
     Pure function of best.pt and the validation set, so a kill anywhere in here is
     repaired by running it again. Returns False if metrics.json already existed.
+    Provenance comes from `state` (fixed at startup): the code this process runs,
+    every process that worked on the run, and any allowed code change.
     """
     run = Path(run)
+    code = state.get("code") or {"commit": "unknown", "dirty": None, "source": "none"}
     if state["best_epoch"] is None:
         raise SystemExit("no epoch produced a finite validation IoU; there is no best.pt to score")
     meta = load_checkpoint(run / "best.pt", model, map_location=device)
@@ -593,9 +615,11 @@ def finish(*, model, val_ds, run: Path, cfg: dict, state: dict, device: str, use
         "val": agg, "per_image": rows,
         "best_epoch": state["best_epoch"], "best_val_iou": state["best"],
         "history": state["history"], "resumes": state["resumes"],
-        "git_commit": git_commit(), "git_dirty": git_dirty(),
+        "code_commit": code["commit"], "code_dirty": code["dirty"], "code_source": code["source"],
+        "git_commit": code["commit"], "git_dirty": code["dirty"],        # the older names
+        "processes": state.get("processes", []), "code_changes": state.get("code_changes", []),
         "torch_version": torch.__version__,
-        "device_name": (torch.cuda.get_device_name(0) if str(device).startswith("cuda") else "cpu"),
+        "device_name": device_name,
         "hostname": socket.gethostname(),
         "wall_seconds": round(state["wall_seconds"] + (time.monotonic() - t0), 3),
         **extra,
@@ -617,8 +641,16 @@ def main(argv=None) -> int:
     run = Path(cfg["runs_dir"]) / run_name(cfg)
     device = resolve_device(args.device)       # an explicit cuda never falls back to the CPU
     use_amp = bool(cfg["amp"])
+    # Provenance is fixed ONCE, here, before any work: what this process imported (never
+    # re-read later, when the live tree may have moved on) and what it runs on. Both calls
+    # can fail, and must fail now rather than after a day of training.
+    code = code_identity(PROJECT)
+    device_name = (torch.cuda.get_device_name(torch.device(device))
+                   if str(device).startswith("cuda") else "cpu")
     print(f"rung={cfg['rung'] or '-'} seed={cfg['seed']} dataset={cfg['dataset']} "
           f"model={cfg['model']} device={device} amp={use_amp} run={run}", flush=True)
+    print(f"code={code['commit'][:12]}{'+dirty' if code['dirty'] else ''} ({code['source']}) "
+          f"host={socket.gethostname()} device_name={device_name} pid={os.getpid()}", flush=True)
 
     def build():
         set_seed(cfg["seed"])                  # immediately before build_model, nothing between
@@ -647,12 +679,12 @@ def main(argv=None) -> int:
         # Under the lock every temp file is the debris of a dead process: a half-written
         # checkpoint is never read, but it is 300 MB.
         clear_stale_temps(run)
-        return _train(args, cfg, run, device, build)
+        return _train(args, cfg, run, device, build, code, device_name)
     finally:
         lock.release()
 
 
-def _train(args, cfg: dict, run: Path, device: str, build) -> int:
+def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_name: str) -> int:
     """Everything `main` does to the run directory. The caller holds the run's lock."""
     is_cuda = str(device).startswith("cuda")
     use_amp = bool(cfg["amp"])
@@ -701,13 +733,22 @@ def _train(args, cfg: dict, run: Path, device: str, build) -> int:
 
         if resume is not None:
             state = load_state(resume, model, optimizer, scheduler, cfg, steps_per_epoch,
-                               map_location=device)
+                               map_location=device, code=code,
+                               allow_code_change=args.allow_code_change)
             repair_best(run, model, cfg, state)
             write_json_atomic(run / "history.json", state["history"])
             print(f"resumed from {resume} at epoch {state['epoch']} step "
                   f"{state['step_in_epoch']}", flush=True)
         else:
             state = fresh_state()
+        # Every checkpoint written from here on names this code and this process.
+        state["code"] = code
+        state["processes"].append({
+            "hostname": socket.gethostname(), "pid": os.getpid(), "device_name": device_name,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "code_commit": code["commit"], "code_dirty": code["dirty"],
+            "first_epoch": state["epoch"],      # == cfg["epochs"]: the finish phase only
+            "last_epoch": state["epoch"]})
         saved = resume is not None and resume.resolve() == (run / "latest.pt").resolve()
         print(f"{n_params / 1e6:.1f}M params, {steps_per_epoch} steps/epoch x {cfg['epochs']} "
               f"epochs, {len(train_ds.rows)} training images", flush=True)
@@ -748,6 +789,7 @@ def _train(args, cfg: dict, run: Path, device: str, build) -> int:
             return EXIT_REQUEUE
         finish(model=model, val_ds=val_ds, run=run, cfg=cfg, state=state, device=device,
                use_amp=use_amp, eval_workers=cfg["eval_workers"],
+               device_name=device_name,
                extra={"n_params": n_params, "steps_per_epoch": steps_per_epoch,
                       "n_train_images": len(train_ds.rows), "n_val_images": len(val_ds)})
         return EXIT_OK

@@ -13,7 +13,6 @@ import json
 import multiprocessing as mp
 import os
 import socket
-import subprocess
 import sys
 import warnings
 from collections import deque
@@ -30,7 +29,8 @@ from .engine import load_checkpoint
 from .image_metrics import image_metrics
 from .metrics import confusion, metrics_from_confusion
 from .models.segmenter import build_model
-from .runtime import PreflightFailed, RunLock, clear_stale_temps, run_cli, tmp_name
+from .runtime import (PreflightFailed, RunLock, clear_stale_temps, code_identity, run_cli,
+                      tmp_name)
 
 _COUNTS = ("tp", "fp", "fn", "tn")
 _ROW_NONMETRIC = ("id", "n_valid", "tp", "fp", "fn", "n_gt", "n_pred")
@@ -198,15 +198,6 @@ class _Limited:
         return self.ds[i]
 
 
-def _git_commit():
-    try:
-        r = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
-    except Exception:
-        return None
-
-
 def _publish(tmp: Path, out_path: Path, force: bool, guard: bool) -> int:
     """Move `tmp` into place without ever destroying an existing result.
 
@@ -257,6 +248,7 @@ def _score(a, run: Path, device: str) -> int:
     """Score and publish. The caller holds the run's lock."""
     out_path = run / f"{a.split}_metrics.json"
     guard = a.split == "test"
+    code = code_identity()                         # fixed now, not after scoring
     # The test set is scored once: refuse BEFORE doing any work.
     if guard and out_path.exists() and not a.force:
         print(f"refusing: {out_path} already exists. The test set is scored once; "
@@ -283,9 +275,13 @@ def _score(a, run: Path, device: str) -> int:
           "limit": a.limit, "checkpoint_epoch": ck.get("epoch"),
           "checkpoint_best_val": ck.get("best"),
           "timestamp": datetime.now(timezone.utc).isoformat()}
-    commit = _git_commit()
-    if commit:
-        ev["git_commit"] = commit
+    # Which code scored, and which code trained (they are the same commit when both steps
+    # ran from one frozen snapshot; if not, the result says so).
+    ev.update(code_commit=code["commit"], code_dirty=code["dirty"], git_commit=code["commit"],
+              train_code_commit=meta.get("code_commit"))
+    if meta.get("code_commit") not in (None, code["commit"]):
+        print(f"WARNING: scoring with code {code['commit']} a run trained with code "
+              f"{meta['code_commit']}", file=sys.stderr)
     payload = {"cfg": cfg, "threshold": threshold, "split": a.split,
                "protocol": "standard" if standard else "nonstandard", "eval": ev,
                "aggregate": agg, "per_image": rows}

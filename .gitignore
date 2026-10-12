@@ -10,3 +10,5 @@ _probe.txt
 *.pth
 .superpowers/
 runs_smoke/
+runs_canary/
+releases/

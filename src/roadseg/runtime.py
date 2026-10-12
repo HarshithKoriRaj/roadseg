@@ -25,7 +25,9 @@ import errno
 import fcntl
 import multiprocessing
 import os
+import re
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -128,6 +130,65 @@ def clear_stale_temps(run) -> list[str]:
             p.unlink(missing_ok=True)
             removed.append(p.name)
     return sorted(removed)
+
+
+CODE_ROOT = Path(__file__).resolve().parents[2]       # the tree this package was imported from
+
+
+def _git(root, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                           timeout=60)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def code_identity(root=None) -> dict:
+    """Which code this process is running: {"commit", "dirty", "source"}.
+
+    A frozen snapshot (scripts/launch.sh) carries a COMMIT file with the full sha of the
+    commit it is an archive of: that is the identity, and it is clean by construction.
+    Otherwise (a working tree: tests, rehearsals) it is `git rev-parse HEAD` plus a dirty
+    flag -- True if anything tracked or untracked-and-not-ignored differs from the commit,
+    None if git cannot tell. `root` is where the imported package lives, never the current
+    directory; if $ROADSEG_CODE is set it must be that same tree, or the job would record
+    one code and run another (Refused).
+    """
+    root = Path(root) if root is not None else CODE_ROOT
+    env = os.environ.get("ROADSEG_CODE")
+    if env and os.path.realpath(env) != os.path.realpath(root):
+        raise Refused(f"ROADSEG_CODE={env} but roadseg was imported from {root}: PYTHONPATH "
+                      f"does not point into the snapshot. Not running code of unknown identity.")
+    marker = root / "COMMIT"
+    if marker.is_file():
+        sha = marker.read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise Refused(f"{marker} does not hold a full commit sha ({sha[:60]!r})")
+        return {"commit": sha, "dirty": False, "source": str(marker)}
+    top = _git(root, "rev-parse", "--show-toplevel")
+    if top is None or os.path.realpath(top) != os.path.realpath(root):
+        # not a repository of its own (e.g. a snapshot without COMMIT inside the project
+        # repository): the enclosing repository's HEAD would be a lie
+        return {"commit": "unknown", "dirty": None, "source": "none"}
+    status = _git(root, "status", "--porcelain")
+    return {"commit": _git(root, "rev-parse", "HEAD") or "unknown",
+            "dirty": None if status is None else bool(status), "source": "git"}
+
+
+def same_code(a: dict | None, b: dict | None) -> bool:
+    """Do two code identities name the same code? (Where the code lies does not matter.)
+    Two dirty trees at one commit compare equal: git cannot tell them apart, and the dirty
+    flag is on record. A checkpoint with no identity matches nothing."""
+    return (a is not None and b is not None
+            and (a.get("commit"), a.get("dirty")) == (b.get("commit"), b.get("dirty")))
+
+
+def describe_code(c: dict | None) -> str:
+    if c is None:
+        return "<not recorded>"
+    flag = {True: " +uncommitted changes", False: "", None: " (dirty state unknown)"}[c.get("dirty")]
+    return f"{c.get('commit')}{flag}"
 
 
 def kill_children(timeout: float = 10.0) -> int:
