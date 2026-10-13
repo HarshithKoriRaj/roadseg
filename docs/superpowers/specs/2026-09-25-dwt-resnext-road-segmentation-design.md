@@ -406,3 +406,43 @@ Test-first, with tests that can actually fail:
 - Kaggle API token is not configured (`~/.kaggle/kaggle.json` absent). Required
   to download DeepGlobe. Massachusetts can come from the Toronto source.
   Neither dataset is currently present on `/scratch`.
+
+  *Resolved 2026-10-11:* both datasets are on disk and verified; DeepGlobe came
+  from a Hugging Face mirror, not Kaggle (see §15).
+
+## 15. Amendments made during implementation (as launched, 2026-10-12)
+
+Sections 5.4–5.6 carry their own dated amendments. The points below amend the
+remaining sections; where they conflict with the text above, they are what was
+built and launched. `docs/DECISIONS.md` gives the reasoning and the cost of each.
+
+- **§4, §7 — R3's loss.** R3 = BCE + Dice + 0.5·(1 − clDice). The clDice function
+  reused from `sam2_road_dac` (§9, "copy as-is") also contained a Dice term; it is
+  no longer called by the training loss.
+- **§6.2 — tiling.** Evaluation tiles are edge-flush (the last tile is aligned to
+  the image edge), not reflection-padded. Every tile is real imagery.
+- **§6.2 — no-data.** No-data is a connected white region of at least 2500 px,
+  Massachusetts only, and it is also excluded from the *training loss* and from
+  crop sampling — the labels have roads drawn through the blank regions.
+- **§6.3 — DeepGlobe source and split.** Hugging Face mirror
+  `lammtfkday/deepglobe-roads`, flattened to the original layout; split 70/15/15
+  by image with seed 1337 (4358/933/935), pinned by a sha256 fingerprint.
+- **§7 — metrics.** Relaxed F1 uses a Euclidean ρ = 3 px. An image with no valid
+  pixels scores NaN and is excluded from means. APLS: both graphs empty → 1.0,
+  one empty → 0.0. IoU at a fixed threshold 0.5 is recorded beside the IoU at the
+  validation-selected threshold, and test probability maps are saved.
+- **§8 — statistics.** The primary analysis is R1 − R0 in per-image test IoU with a
+  **two-level bootstrap** (seeds within arm, then images); a seed-paired t interval
+  is reported beside it, and a difference is claimed only if both exclude zero.
+  The image-level paired bootstrap originally specified is still reported, named
+  for what it estimates (these trained models, not the training procedure).
+  Everything else is secondary. The analysis plan is embedded in the aggregation
+  output and was committed before any result existed.
+- **§8 — grid.** 36 runs as specified; the test split is scored once per run by
+  `roadseg.eval`, which refuses to score it again.
+- **§10 — cluster.** This account can submit GPU jobs only to `l40s_public` and
+  `h200_public`. Jobs run from a frozen code snapshot (`releases/<sha>/`) and are
+  submitted only through `scripts/launch.sh`. Loss is computed in fp32; the LR
+  schedule is stepped per iteration; checkpoints are written every 5 minutes.
+- **§9 — reuse.** The APLS port fixed a third defect (the mask-to-graph rule), and
+  `graph_from_mask` follows skeleton connectivity.
