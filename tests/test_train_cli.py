@@ -2174,6 +2174,19 @@ def test_wrapper_term_after_usr1_still_does_not_requeue(tmp_path):
     assert log[-1] == "train got SIGTERM", out
 
 
+def test_wrapper_second_usr1_while_watchdog_pending_does_not_kill_the_wrapper(tmp_path):
+    """A bare `return` in a function entered from a trap returns the interrupted `wait`'s
+    status (128+signal) and, under set -e, kills the wrapper (exit 138: no requeue, step left
+    running). A second USR1 with the watchdog pending and the step still running must be
+    harmless: one requeue, exit 0."""
+    rc, log, out = _wrapper(tmp_path, {"train": {"block": True, "linger": 1.0}},
+                            signal_step="train", signum=(signal.SIGUSR1, signal.SIGUSR1),
+                            env_extra={"ROADSEG_USR1_WATCHDOG": "40"})
+    assert rc == 0, out
+    assert _requeues(log) == ["scontrol requeue 777_4"], out
+    assert "watchdog:" not in out
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

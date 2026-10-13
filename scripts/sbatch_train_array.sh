@@ -162,7 +162,7 @@ watchdog=""          # pid of the pending watchdog
 watchdog_fired=0
 start_watchdog() {
     if [[ -n "$watchdog" || -z "$child" ]] || (( got_term )); then
-        return
+        return 0
     fi
     ( trap 'kill "$nap" 2>/dev/null; exit 0' TERM
       sleep "$WATCHDOG_SECONDS" &
@@ -180,7 +180,7 @@ stop_watchdog() {
 on_watchdog() {
     watchdog=""
     if (( got_term )) || [[ -z "$child" ]] || ! kill -0 "$child" 2>/dev/null; then
-        return                             # TERM takes precedence; or the step is already gone
+        return 0                           # TERM takes precedence; or the step is already gone
     fi
     watchdog_fired=1
     echo "watchdog: pid $child is still running ${WATCHDOG_SECONDS} s after USR1 was forwarded;" \
