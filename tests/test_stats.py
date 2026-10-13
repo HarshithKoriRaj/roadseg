@@ -865,7 +865,7 @@ def test_a_floor_that_leaves_fewer_than_two_images_reports_none(runs):
 
 OLD_KEYS = {"n_images", "n_missing_ids", "n_dropped_nan", "image_level", "two_level", "seed_level"}
 NEW_KEYS = {"role", "seed_paired_t", "pooled_iou", "n_gt_floors", "top_images", "iou_at_0.5",
-            "pooled_iou_at_0.5", "skipped"}
+            "pooled_iou_at_0.5", "skipped", "decision", "decision_basis"}
 
 
 def _robustness(text, rung):
@@ -978,3 +978,63 @@ def test_json_only_writes_the_same_summary_and_prints_no_table(tmp_path, capsys)
     assert io.out.splitlines() == [f"wrote {f}"]
     # nothing is lost: what the table would have warned about goes to stderr
     assert "WARNING: iou_at_0.5 skipped for R1" in io.err and "robustness" not in io.err
+
+
+# ------------------------------------------------- the pre-specified decision rule
+
+def _ci(lo, hi):
+    return {"mean_diff": (lo + hi) / 2, "ci_low": lo, "ci_high": hi, "p_value": 0.5}
+
+
+@pytest.mark.parametrize("boot, t, expected, reason", [
+    (_ci(0.01, 0.03), _ci(0.005, 0.04), "difference", None),              # both exclude 0, same sign
+    (_ci(-0.03, -0.01), _ci(-0.04, -0.005), "difference", None),          # ... also when negative
+    (_ci(0.01, 0.03), _ci(-0.04, -0.005), "inconclusive", "opposite signs"),
+    (_ci(0.01, 0.03), _ci(-0.01, 0.04), "inconclusive", "only the two-level bootstrap"),
+    (_ci(-0.01, 0.03), _ci(0.005, 0.04), "inconclusive", "only the seed-paired t"),
+    (_ci(-0.01, 0.03), _ci(-0.02, 0.04), "no_detected_difference", None),
+    (_ci(0.01, 0.03), None, "inconclusive", "seed-paired t interval unavailable"),
+    (None, _ci(0.005, 0.04), "inconclusive", "two-level bootstrap interval unavailable"),
+])
+def test_decision_rule_requires_both_intervals_to_exclude_zero_with_one_sign(boot, t, expected,
+                                                                            reason):
+    decision, basis = stats.decide(boot, t)
+    assert decision == expected
+    assert (basis["reason"] is None) if reason is None else (reason in basis["reason"])
+    assert set(basis) == {"two_level", "seed_paired_t", "reason"}
+
+
+def test_a_degenerate_t_interval_cannot_support_a_claim():
+    """Identical per-seed differences give a zero-width t interval that 'excludes zero' by
+    construction; with 3 seeds that is no evidence, so the rule treats it as unavailable."""
+    t = dict(_ci(0.02, 0.02), degenerate=True)
+    decision, basis = stats.decide(_ci(0.01, 0.03), t)
+    assert decision == "inconclusive" and "degenerate" in basis["reason"]
+
+
+def test_an_interval_touching_zero_does_not_exclude_it():
+    assert stats.decide(_ci(0.0, 0.03), _ci(0.005, 0.04))[0] == "inconclusive"
+
+
+def test_the_decision_rule_is_part_of_the_analysis_plan():
+    rule = stats.ANALYSIS_PLAN["decision_rule"]
+    assert "BOTH" in rule and "same sign" in rule and "inconclusive" in rule
+    assert "seeds 3 and 4" in rule and "no detected difference" in rule
+
+
+def test_tiny_p_values_print_as_a_bound_not_as_zero():
+    assert stats._fmt_p(0.0) == "<0.0001" and stats._fmt_p(9.9e-5) == "<0.0001"
+    assert stats._fmt_p(1e-4).strip() == "0.0001" and stats._fmt_p(0.25).strip() == "0.2500"
+
+
+def test_summary_and_table_carry_the_decision_for_every_comparison(tmp_path, capsys):
+    _flip_runs(tmp_path)
+    out = _table(capsys, tmp_path).out
+    summary = json.loads((tmp_path / "massachusetts_test_summary.json").read_text())
+    allowed = {"difference", "inconclusive", "no_detected_difference"}
+    for rung, v in summary["vs_baseline"].items():
+        assert v["decision"] in allowed, rung
+        assert v["decision"] == stats.decide(v["two_level"], v["seed_paired_t"])[0], rung
+    primary = [ln for ln in out.splitlines() if ln.startswith("PRIMARY DECISION")]
+    assert len(primary) == 1 and summary["vs_baseline"]["R1"]["decision"] in primary[0]
+    assert "p=0.0000" not in out            # a Monte Carlo p-value never prints as zero

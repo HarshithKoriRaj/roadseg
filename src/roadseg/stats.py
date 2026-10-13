@@ -65,6 +65,12 @@ ANALYSIS_PLAN = {
                       "interval covered 0.94-0.98 in most simulated regimes and 0.86 when seed "
                       "variance dominated at n = 935, so it can be anti-conservative; the "
                       "seed-paired t interval is reported beside it."),
+    "decision_rule": ("A difference between R1 and R0 is claimed only if BOTH the two-level "
+                     "bootstrap interval and the seed-paired t interval exclude zero, with the "
+                     "same sign. If exactly one excludes zero, the result is reported as "
+                     "inconclusive at this number of seeds, and seeds 3 and 4 are run for R0 and "
+                     "R1 before any claim. If neither excludes zero, the result is reported as "
+                     "no detected difference, with both intervals."),
     "scope": ("The plan is applied to each dataset separately (one summary per dataset); nothing "
               "is corrected for there being more than one dataset."),
     "sensitivity": {
@@ -77,6 +83,44 @@ ANALYSIS_PLAN = {
                  "difference are listed. The floors are fixed here, not tuned."),
     },
 }
+
+
+def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:
+    """ANALYSIS_PLAN["decision_rule"] applied to one comparison: (decision, decision_basis).
+
+    decision is "difference" (both intervals exclude zero, same sign), "inconclusive" (exactly
+    one excludes zero, or they exclude it with opposite signs, or the seed-paired t interval is
+    unavailable) or "no_detected_difference" (neither excludes zero). A degenerate t interval
+    (identical per-seed differences: zero width, no t statistic) counts as unavailable.
+    """
+    def side(b):
+        if b is None or b.get("ci_low") is None or b.get("ci_high") is None:
+            return None
+        return 1 if b["ci_low"] > 0 else -1 if b["ci_high"] < 0 else 0
+
+    keep = ("mean_diff", "ci_low", "ci_high", "p_value")
+    basis = {"two_level": None if two_level is None else {k: two_level.get(k) for k in keep},
+             "seed_paired_t": None if paired_t is None else {k: paired_t.get(k) for k in keep},
+             "reason": None}
+    b, t = side(two_level), side(paired_t)
+    if b is None:
+        basis["reason"] = "two-level bootstrap interval unavailable"
+        return "inconclusive", basis
+    if t is None or paired_t.get("degenerate"):
+        basis["reason"] = ("seed-paired t interval unavailable (needs at least 2 common seeds)"
+                           if t is None else
+                           "seed-paired t interval degenerate (identical per-seed differences)")
+        return "inconclusive", basis
+    if b and t:
+        if b == t:
+            return "difference", basis
+        basis["reason"] = "both intervals exclude zero but with opposite signs"
+        return "inconclusive", basis
+    if b or t:
+        basis["reason"] = ("only the two-level bootstrap interval excludes zero" if b else
+                           "only the seed-paired t interval excludes zero")
+        return "inconclusive", basis
+    return "no_detected_difference", basis
 
 
 def _plan_deviations(*, metric: str, split: str, baseline: str, n_boot: int, seed: int,
@@ -666,6 +710,7 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
         else:
             at_05 = _compare(*fixed, r_seeds, base_seeds, n_boot, seed)
 
+        decision, decision_basis = decide(two_level, paired_t)
         vs[rung] = {"n_images": len(common), "n_missing_ids": n_missing,
                     "n_dropped_nan": image_level["n_dropped"],
                     "image_level": image_level, "two_level": two_level,
@@ -674,7 +719,7 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
                     "seed_paired_t": paired_t, "pooled_iou": pooled("pooled_iou"),
                     "n_gt_floors": floors, "top_images": top_images(common, R, Bm, n_gt),
                     "iou_at_0.5": at_05, "pooled_iou_at_0.5": pooled("pooled_iou_at_0.5", "_0.5"),
-                    "skipped": skipped}
+                    "skipped": skipped, "decision": decision, "decision_basis": decision_basis}
         for analysis, why in skipped.items():
             skips.setdefault((analysis, why), []).append(rung)
     warns.extend(f"{analysis} skipped for {', '.join(rr)}: {why}" for (analysis, why), rr in skips.items())
@@ -697,11 +742,16 @@ def _fmt(x) -> str:
     return "   n/a" if x is None else f"{x:6.4f}"
 
 
+def _fmt_p(p: float) -> str:
+    """A p-value to 4 places; below 1e-4 it prints as <0.0001, never as 0.0000."""
+    return "<0.0001" if p < 1e-4 else f"{p:7.4f}"
+
+
 def _iv(tag: str, b: dict | None) -> str:
     """'tag +diff [low,high] p=...' for a result with an interval; 'tag n/a' if not computed."""
     if b is None:
         return f"{tag} n/a"
-    p = "n/a" if b["p_value"] is None else f"{b['p_value']:.4f}"
+    p = "n/a" if b["p_value"] is None else _fmt_p(b["p_value"]).strip()
     return f"{tag} {b['mean_diff']:+.4f} [{b['ci_low']:+.4f},{b['ci_high']:+.4f}] p={p}"
 
 
@@ -767,11 +817,18 @@ def format_table(out: dict) -> list[str]:
         if v:
             t = v["two_level"]
             line += (f" {t['mean_diff']:+8.4f} [{t['ci_low']:+.4f},{t['ci_high']:+.4f}] "
-                     f"{t['p_value']:7.4f} {v['n_images']:6d}  "
+                     f"{_fmt_p(t['p_value']):>7} {v['n_images']:6d}  "
                      + ("PRIMARY" if v["role"] == "primary" else "(secondary)"))
         else:
             line += f" {'':8} {'':18} {'':7} {r['n_images']:6d}  (baseline)"
         lines.append(line)
+    for rung, v in out["vs_baseline"].items():
+        if v["role"] == "primary":
+            why = v["decision_basis"]["reason"]
+            lines.append(f"PRIMARY DECISION ({rung} vs {baseline}, rule in the plan): {v['decision']}"
+                         + (f" -- {why}" if why else "") + "; "
+                         + _iv("boot", v["decision_basis"]["two_level"]) + "; "
+                         + _iv("t", v["decision_basis"]["seed_paired_t"]))
     if out["vs_baseline"]:
         lines.append("robustness (secondary, no multiplicity correction; boot = two-level bootstrap, "
                      "t = seed-paired t interval; each as: difference [95% CI] p)")
