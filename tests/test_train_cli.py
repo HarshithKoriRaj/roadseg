@@ -3030,19 +3030,40 @@ def test_real_data_end_to_end(tmp_path):
     assert r.returncode == 2 and "already exists" in r.stderr
 
 
+SHA_C = "c" * 40
+
+
+def _frozen_copy(tmp_path) -> Path:
+    """This tree's code as the jobs get it: a snapshot directory with src, configs, scripts
+    and a COMMIT file (what scripts/launch.sh builds with `git archive`), for $ROADSEG_CODE.
+
+    The script rehearsals below run from it for two reasons. It is the production mode -- the
+    snapshot's COMMIT is the code identity, PYTHONPATH points into the snapshot. And it makes
+    them independent of the repository's HEAD: run from the live tree, a commit made by
+    anyone while the test runs changes the code identity between two processes of one run
+    (first seen in the full suite of 2026-10-12: the canary's own provenance check failed).
+    """
+    snap = tmp_path / "release"
+    for sub in ("src", "configs", "scripts"):
+        shutil.copytree(ROOT / sub, snap / sub, ignore=shutil.ignore_patterns("__pycache__"))
+    (snap / "COMMIT").write_text(SHA_C + "\n")
+    return snap
+
+
 @pytest.mark.slow
 @needs_data
 @needs_ram
 def test_the_smoke_drills_rehearsed_with_a_job_wide_sigterm(tmp_path):
     """G7. The two preemption drills of the CPU rehearsal, as the script runs them: real
     ResNeXt, real data, DataLoader workers, SIGTERM to the whole process group."""
-    runs = tmp_path / "runs_smoke"
+    runs, snap = tmp_path / "runs_smoke", _frozen_copy(tmp_path)
     env = dict(ENV, ROADSEG_RUNS_SMOKE=str(runs), SMOKE_STEPS="drills", SMOKE_TILE="128",
-               SMOKE_THREADS="4")
-    env.pop("ROADSEG_CODE", None)
-    r = subprocess.run(["bash", str(SMOKE)], capture_output=True, text=True, timeout=3000, env=env)
+               SMOKE_THREADS="4", ROADSEG_CODE=str(snap))
+    r = subprocess.run(["bash", str(snap / "scripts/sbatch_smoke_cpu.sh")], capture_output=True,
+                       text=True, timeout=3000, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out[-6000:]
+    assert f"code {snap}  commit {SHA_C}" in out                    # it ran the frozen copy
     assert out.count("final state ok: 2 history rows") == 2 and "SMOKE: ALL PASSED" in out
     assert out.count("preempted: checkpoint saved at epoch") >= 2
     assert "bf16 autocast on CPU" not in out and "score the test split" not in out   # drills only
@@ -3056,17 +3077,18 @@ def test_the_canary_script_rehearsed_on_cpu(tmp_path):
     """G6. scripts/sbatch_canary.sh will run for the first time on a GPU after a day in the
     queue; rehearse the script itself here -- real ResNeXt, real data, tiny sizes, on CPU:
     the preflight table, two miniature runs with test scoring, and the kill-and-resume drill."""
-    runs = tmp_path / "runs_canary"
+    runs, snap = tmp_path / "runs_canary", _frozen_copy(tmp_path)
     env = dict(ENV, OMP_NUM_THREADS="4", MKL_NUM_THREADS="4", CANARY_THREADS="4",
                ROADSEG_RUNS_CANARY=str(runs), CANARY_DEVICE="cpu", CANARY_NAMES="R3 unet",
                CANARY_TRAIN_EXTRA="--preflight --no-amp --tile 128 --batch-size 2",
                CANARY_MINI="--epochs 1 --max-train-batches 3 --limit-train 4 --limit-val 1 --workers 2",
-               CANARY_EVAL_EXTRA="--tile 128 --stride 64 --workers 2", CANARY_DRILL_STEPS="2")
-    env.pop("ROADSEG_CODE", None)
-    r = subprocess.run(["bash", str(ROOT / "scripts/sbatch_canary.sh")], capture_output=True,
+               CANARY_EVAL_EXTRA="--tile 128 --stride 64 --workers 2", CANARY_DRILL_STEPS="2",
+               ROADSEG_CODE=str(snap))
+    r = subprocess.run(["bash", str(snap / "scripts/sbatch_canary.sh")], capture_output=True,
                        text=True, env=env, timeout=3000)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out[-6000:]
+    assert f"code {snap}  commit {SHA_C}" in out                    # it ran the frozen copy
     assert r.stdout.rstrip().splitlines()[-1].startswith("CANARY: ALL PASSED"), out[-2000:]
     table = out[out.index("preflight table"):].splitlines()[1:4]
     assert table[0].split() == ["name", "steps/s", "peak", "GB"]
