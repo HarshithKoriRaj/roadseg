@@ -2002,6 +2002,34 @@ def test_launch_dry_run_prints_the_plan_and_creates_nothing(tmp_path):
     assert f"{export} {snap}/scripts/sbatch_canary.sh" in out
 
 
+def test_launch_geo_campaign_submits_12_tasks_and_names_the_campaign(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    snap = repo / "releases" / short
+    rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", "--campaign", "geo", smoke=sha)
+    assert rc == 0, out + err
+    export = f"--export=ALL,ROADSEG_CODE={snap},ROADSEG_CAMPAIGN=geo"
+    assert (f"would run: {tmp_path / 'fake_sbatch'} --parsable --array=0-11%12 {export} "
+            f"{snap}/scripts/sbatch_train_array.sh") in out
+    assert f"{export} {snap}/scripts/sbatch_aggregate.sh" in out and calls == []
+    # a stray ROADSEG_CAMPAIGN in the caller's shell never reaches a dwt launch
+    rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", smoke=sha,
+                                  env_extra={"ROADSEG_CAMPAIGN": "geo"})
+    assert rc == 0 and "ROADSEG_CAMPAIGN" not in out and "--array=" not in out, out + err
+    for bad in (("--campaign",), ("--campaign", "nope")):
+        rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", *bad, smoke=sha)
+        assert rc == 2 and calls == [], out + err
+
+
+def test_array_map_of_the_geo_campaign(tmp_path):
+    import subprocess
+    out = subprocess.run(["bash", str(ROOT / "scripts/sbatch_train_array.sh"), "--print-map"],
+                         env={"PATH": "/usr/bin:/bin", "ROADSEG_CAMPAIGN": "geo"},
+                         capture_output=True, text=True, check=True).stdout.split("\n")
+    names = [line.split()[-1] for line in out if line.strip()]
+    assert names == [f"{d}_{r}_s{s}" for d in ("massachusetts", "deepglobe")
+                     for r in ("GA", "GB") for s in (0, 1, 2)]
+
+
 def test_launch_refuses_a_dirty_tree(tmp_path):
     repo, sha, short = _launch_repo(tmp_path)
     (repo / "src" / "roadseg" / "train.py").write_text("VERSION = 2\n")      # modified, tracked

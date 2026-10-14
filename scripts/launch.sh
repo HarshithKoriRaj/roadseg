@@ -142,7 +142,11 @@ for knob in $(compgen -e | grep -E '^(CANARY_|SMOKE_)' || true); do
     echo "launch.sh: not passing $knob to the job"
     unset "$knob"
 done
-EXPORT="--export=ALL,ROADSEG_CODE=$SNAP,ROADSEG_CAMPAIGN=$campaign"
+unset ROADSEG_CAMPAIGN                  # only this launch's --campaign reaches the jobs
+EXPORT="--export=ALL,ROADSEG_CODE=$SNAP"
+if [[ "$campaign" != dwt ]]; then       # dwt: exactly the first campaign's submission
+    EXPORT="$EXPORT,ROADSEG_CAMPAIGN=$campaign"
+fi
 stamp=$(date +%Y-%m-%dT%H:%M:%S%z)
 
 # submit <label> <sbatch args...>  -> JOB = the job id (a placeholder in a dry run)
@@ -183,7 +187,9 @@ else
     agg=$JOB
     echo "array job: $jid   (campaign $campaign, $NTASKS tasks; logs: $SLURM_LOGS/roadseg_${jid}_<task>.out)"
     echo "aggregate job: $agg   (runs after every task of $jid has ended)"
-    line="$stamp sha=$sha snapshot=$SNAP campaign=$campaign array=$jid aggregate=$agg"
+    tag=""
+    [[ "$campaign" == dwt ]] || tag=" campaign=$campaign"
+    line="$stamp sha=$sha snapshot=$SNAP$tag array=$jid aggregate=$agg"
 fi
 echo "code: $SNAP (commit $sha)"
 if (( ! dry )); then
