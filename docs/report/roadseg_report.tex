@@ -93,6 +93,81 @@ else is secondary and reported without multiplicity correction. The plan and the
 committed to the code repository before any test score was read.
 
 %=====================================================================================
+\section{Related work}
+\label{sec:related}
+%=====================================================================================
+
+\subsection{Road extraction as pixel classification}
+
+Mnih and Hinton \cite{mnih2010} trained a neural network on image patches to label road pixels
+in aerial imagery. They introduced the Massachusetts Roads benchmark and the \emph{relaxed}
+precision and recall that tolerate a few pixels of misregistration between labels and imagery
+\cite{mnih2013}. Fully convolutional networks \cite{long2015} and the U-Net encoder--decoder with
+skip connections \cite{ronneberger2015} replaced patch classifiers. The residual U-Net of Zhang
+et al.\ \cite{zhang2018res} reached a relaxed precision--recall breakeven of 0.9187 on
+Massachusetts with a quarter of U-Net's parameters. On DeepGlobe \cite{demir2018},
+D-LinkNet \cite{zhou2018} --- a LinkNet with an ImageNet-pretrained ResNet-34 encoder and a
+centre block of cascaded dilated convolutions --- won the 2018 road extraction challenge.
+NL-LinkNet \cite{wang2019nl} replaced the dilated block with non-local operations and reported
+a small gain with fewer parameters.
+
+\subsection{Connectivity and topology}
+
+Pixel-wise losses tolerate small gaps that break a road network. DeepRoadMapper
+\cite{mattyus2017} repaired gaps by reasoning over a road graph; Mosinska et al.\
+\cite{mosinska2018} added a perceptual topology loss; Batra et al.\ \cite{batra2019} learned road
+orientation jointly with segmentation and refined connectivity; CoANet \cite{mei2021} used strip
+convolutions and a connectivity attention module; clDice \cite{shit2021} measures and optimises
+the overlap of soft skeletons. Connectivity is usually evaluated with APLS \cite{vanetten2018},
+which compares shortest-path lengths in graphs built from prediction and ground truth.
+
+\subsection{Graph extraction and foundation models}
+
+Another line of work outputs the road graph directly: iterative tracing in RoadTracer
+\cite{bastani2018}, a graph-tensor encoding in Sat2Graph \cite{he2020sat2graph}, and SAM-Road
+\cite{hetang2024}, which builds on the Segment Anything image encoder. These methods are judged
+on graph metrics and are not directly comparable with the raster metrics used here.
+
+\subsection{Transformers and hybrid encoders}
+
+Transformer and hybrid CNN--transformer encoders dominate recent road extraction results.
+Examples include SegFormer \cite{xie2021segformer} as a generic baseline; Seg-Road \cite{tao2023},
+which pairs a transformer branch for long-range context with a CNN branch and a pixel-connectivity
+structure; URoadNet \cite{uroadnet2024}, a U-Net with dual sparse attention; and DSFC-Net
+\cite{zhang2026dsfc}, which combines a CNN encoder with a spatial--frequency hybrid transformer
+that separates high- and low-frequency content with a Laplacian pyramid.
+
+\subsection{Wavelets in convolutional networks}
+
+The multiresolution wavelet representation \cite{mallat1989} has entered deep networks in several
+ways:
+\begin{itemize}
+  \item \emph{Pooling.} Wavelet pooling \cite{williams2018} replaces max or average pooling by a
+        wavelet decomposition that discards detail bands.
+  \item \emph{Lossless down- and up-sampling.} The multi-level wavelet CNN \cite{liu2018mwcnn}
+        uses the DWT and its inverse for image restoration, keeping all sub-bands. WaveCNet
+        \cite{li2020wavecnet,li2021wavecnet} replaces down-sampling in classification networks by
+        a DWT and reports improved robustness to noise. WaveSNet \cite{li2020wavesnet} applies the
+        same idea to segmentation, with DWT down-sampling and IDWT up-sampling in U-Net, SegNet and
+        DeepLabv3+. Haar wavelet downsampling \cite{xu2023hwd} proposes a Haar-based replacement for
+        strided convolution and pooling in segmentation networks.
+  \item \emph{Anti-aliasing.} Anti-aliased down-sampling \cite{zhang2019} restores shift
+        invariance that strided operations destroy --- the same mechanism several wavelet methods
+        appeal to.
+  \item \emph{Road extraction.} PWFNet \cite{zong2025pwfnet} combines a pyramidal wavelet
+        convolution with Fourier-band attention for road extraction and reports gains on DeepGlobe.
+\end{itemize}
+
+\paragraph{Position of this study.} Most of these works compare a wavelet-equipped network with a
+vanilla counterpart and report gains. We are not aware of a road-extraction study that
+(i) keeps every pretrained weight and initialises the wavelet variant to be \emph{functionally
+identical} to the baseline, (ii) matches parameter counts, data stream, recipe and seeds across
+variants, and (iii) fixes the primary comparison and its decision rule before seeing test results.
+Under those controls the expected effect of a DWT front-end is small, and
+Proposition~\ref{prop:exact} explains why: a DWT followed by a convolution is a reparameterised
+strided convolution.
+
+%=====================================================================================
 \section{Datasets}
 \label{sec:data}
 %=====================================================================================
@@ -611,6 +686,102 @@ Dataset & Model & IoU & Relaxed F1 ($\rho{=}3$) & clDice & APLS \\
 \end{tabular}
 \end{table}
 
+\subsection{Comparison with published results}
+\label{sec:published}
+
+Table~\ref{tab:published} places our numbers beside published road-segmentation results on the
+same two datasets. Published values are copied as printed in the cited source. Where a paper reports
+a baseline it re-ran, the row is labelled ``as reported in''.
+
+\paragraph{These numbers are context, not a ranking.} DeepGlobe's official test labels were never
+released, so every paper evaluates on its own split, and protocols differ in crop size, resizing,
+whether metrics are computed on crops or stitched images, and whether ``IoU'' means road-class IoU
+or the mean over road and background. Massachusetts scores here also exclude no-data pixels.
+How much protocol matters shows in the baselines: the same architecture, D-LinkNet, is reported at
+0.6466 by its authors, 0.6599 by \cite{zhang2026dsfc} and 0.5762 by \cite{tao2023} on DeepGlobe,
+and our reproduction obtains 0.6655. Only comparisons \emph{within} one protocol --- one row group of
+the table --- are like-for-like.
+
+\begin{table}[h]
+\centering
+\caption{Published road-segmentation results on Massachusetts Roads and DeepGlobe, and ours.
+Values $\in[0,1]$ as printed in each source (percentages converted). Different splits and
+protocols: compare within a row group only.}
+\label{tab:published}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lllcc@{}}
+\toprule
+Method & Protocol (split; evaluation) & Metric & Massachusetts & DeepGlobe \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Massachusetts, official split; relaxed precision--recall breakeven ($\rho=3$), as reported in \cite{zhang2018res}}} \\
+Mnih-CNN \cite{mnih2013} & 1108/14/49 & breakeven & 0.8873 & --- \\
+Saito-CNN & 1108/14/49 & breakeven & 0.9047 & --- \\
+U-Net \cite{ronneberger2015} & 1108/14/49 & breakeven & 0.9053 & --- \\
+ResUNet \cite{zhang2018res} & 1108/14/49 & breakeven & 0.9187 & --- \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{DeepGlobe challenge evaluation server (official validation / test images)}} \\
+D-LinkNet \cite{zhou2018} & challenge val / test & road IoU & --- & 0.6466 / 0.6342 \\
+NL-LinkNet \cite{wang2019nl} & challenge val & ``mIoU'' (as named in source) & --- & 0.6500 \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{DeepGlobe 4696/1530 split, full-resolution evaluation \cite{batra2019}}} \\
+RoadCNN \cite{bastani2018}, as reported in \cite{batra2019} & 4696/1530; full image & road IoU & --- & 0.6761 \\
+Orientation + seg.\ \cite{batra2019} & 4696/1530; full image & road IoU (APLS) & --- & 0.6721 (0.7312) \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Seg-Road protocol \cite{tao2023}: Massachusetts 1108/14/49; DeepGlobe 4696/1530; $512^2$ crops}} \\
+D-LinkNet, as reported in \cite{tao2023} & as above & road IoU & 0.6145 & 0.5762 \\
+CoANet \cite{mei2021}, as reported in \cite{tao2023} & as above & road IoU & 0.6167 & 0.5911 \\
+Seg-Road-l \cite{tao2023} & as above & road IoU & 0.6838 & 0.6720 \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{URoadNet protocol \cite{uroadnet2024}: Massachusetts 1108/14/49; DeepGlobe random 4891/190/1145; images resized to $512^2$}} \\
+SegFormer \cite{xie2021segformer}, as reported in \cite{uroadnet2024} & as above & IoU & 0.6009 & 0.6742 \\
+URoadNet \cite{uroadnet2024} & as above & IoU & 0.6761 & 0.6777 \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{DSFC-Net protocol \cite{zhang2026dsfc}: Massachusetts 1108/63; DeepGlobe 4980/1236; patches}} \\
+U-Net, as reported in \cite{zhang2026dsfc} & as above & IoU & 0.6456 & 0.6506 \\
+D-LinkNet, as reported in \cite{zhang2026dsfc} & as above & IoU & 0.6443 & 0.6599 \\
+DSFC-Net \cite{zhang2026dsfc} & as above & IoU & 0.6750 & 0.6868 \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{This study: Massachusetts 1108/14/49 with no-data masked; DeepGlobe 4358/933/935; stitched full images; mean of 3 seeds}} \\
+R0 (stock ResNeXt-50 U-Net) & as above & pooled road IoU & 0.6562 & 0.6771 \\
+R1 (DWT at input) & as above & pooled road IoU & 0.6554 & 0.6785 \\
+R2 (wavelets throughout) & as above & pooled road IoU & 0.6545 & 0.6823 \\
+R3 (R2 + clDice) & as above & pooled road IoU & 0.6553 & 0.6743 \\
+U-Net (from scratch) & as above & pooled road IoU & 0.6632 & 0.6461 \\
+D-LinkNet & as above & pooled road IoU & 0.6515 & 0.6655 \\
+R0 & as above & relaxed F1 ($\rho=3$) & 0.9072 & 0.8978 \\
+R0 & as above & APLS (our implementation) & 0.8047 & 0.7755 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{What the comparison does and does not show.}
+\begin{itemize}
+  \item \textbf{DeepGlobe.} Our models reach 0.677--0.682 pooled road IoU, inside the range of the
+        strongest recent results under other protocols (0.672--0.687) and above the 2018 challenge
+        results (0.6342--0.6500). With different splits, this shows that the ResNeXt-50 U-Net
+        trained here is a strong, current baseline --- not that it outperforms any particular
+        published method.
+  \item \textbf{Massachusetts.} Our 0.652--0.663 is below the 0.675--0.684 reported by Seg-Road,
+        URoadNet and DSFC-Net, and within or above the 0.60--0.65 those papers report for their
+        re-run baselines. Our evaluation excludes no-data pixels, scores stitched full-resolution images,
+        and pools counts over images; the effect of each of these on the number is unknown, so the
+        gap cannot be attributed to the models.
+  \item \textbf{Relaxed metrics.} Our relaxed F1 at the selected threshold (0.907 on Massachusetts)
+        is of the same magnitude as published relaxed breakeven points (0.887--0.919) but is not the
+        same quantity: breakeven is the point of the precision--recall curve where the two are
+        equal, not F1 at a fixed threshold.
+  \item \textbf{Connectivity.} Our APLS uses our own graph construction (Section~\ref{sec:eval}); it
+        is not comparable with the APLS of \cite{batra2019}, which uses a different graph
+        extraction and different ground-truth masks.
+  \item \textbf{Internal consistency of sources.} For a single class, IoU and F1 satisfy
+        $\IoU = F_1/(2-F_1)$. This holds approximately for the DSFC-Net and URoadNet tables, but not
+        for Seg-Road's (road IoU 0.6720 with F1 0.9143 on DeepGlobe), so the F1 there is evidently
+        computed differently; we quote only its road IoU.
+  \item \textbf{What matters for this paper} is not the cross-paper ranking but the controlled
+        comparison of Section~\ref{sec:results}: under identical protocol, the DWT front-end makes
+        no detectable difference.
+\end{itemize}
+
 \subsection{Compute}
 
 All 36 runs trained on single NVIDIA L40S GPUs (48 GB) with bf16 autocast. At batch 16 of $512^2$
@@ -709,6 +880,49 @@ during implementation, with their reasons, are recorded in \texttt{docs/DECISION
   suppress aliasing effect for noise-robust image classification. \emph{IEEE TIP}, 30:7074--7089, 2021.
 \bibitem{liu2018mwcnn} P.~Liu, H.~Zhang, K.~Zhang, L.~Lin, and W.~Zuo. Multi-level wavelet-CNN for
   image restoration. In \emph{CVPR Workshops}, 2018.
+\bibitem{long2015} J.~Long, E.~Shelhamer, and T.~Darrell. Fully convolutional networks for
+  semantic segmentation. In \emph{CVPR}, 2015.
+\bibitem{zhang2018res} Z.~Zhang, Q.~Liu, and Y.~Wang. Road extraction by deep residual U-Net.
+  \emph{IEEE Geoscience and Remote Sensing Letters}, 15(5):749--753, 2018. arXiv:1711.10684.
+\bibitem{wang2019nl} Y.~Wang, J.~Seo, and T.~Jeon. NL-LinkNet: Toward lighter but more accurate
+  road extraction with non-local operations. arXiv:1908.08223, 2019.
+\bibitem{mattyus2017} G.~M\'attyus, W.~Luo, and R.~Urtasun. DeepRoadMapper: Extracting road
+  topology from aerial images. In \emph{ICCV}, 2017.
+\bibitem{mosinska2018} A.~Mosinska, P.~M\'arquez-Neila, M.~Kozi\'nski, and P.~Fua. Beyond the
+  pixel-wise loss for topology-aware delineation. In \emph{CVPR}, 2018.
+\bibitem{batra2019} A.~Batra, S.~Singh, G.~Pang, S.~Basu, C.~V.~Jawahar, and M.~Paluri. Improved
+  road connectivity by joint learning of orientation and segmentation. In \emph{CVPR}, 2019.
+\bibitem{mei2021} J.~Mei, R.-J.~Li, W.~Gao, and M.-M.~Cheng. CoANet: Connectivity attention network
+  for road extraction from satellite imagery. \emph{IEEE TIP}, 30:8540--8552, 2021.
+\bibitem{bastani2018} F.~Bastani et al. RoadTracer: Automatic extraction of road networks from
+  aerial images. In \emph{CVPR}, 2018.
+\bibitem{he2020sat2graph} S.~He et al. Sat2Graph: Road graph extraction through graph-tensor
+  encoding. In \emph{ECCV}, 2020.
+\bibitem{hetang2024} C.~Hetang et al. Segment anything model for road network graph extraction.
+  In \emph{CVPR Workshops}, 2024.
+\bibitem{xie2021segformer} E.~Xie, W.~Wang, Z.~Yu, A.~Anandkumar, J.~M.~Alvarez, and P.~Luo.
+  SegFormer: Simple and efficient design for semantic segmentation with transformers. In
+  \emph{NeurIPS}, 2021.
+\bibitem{tao2023} J.~Tao, Z.~Chen, Z.~Sun, H.~Guo, B.~Leng, Z.~Yu, Y.~Wang, Z.~He, X.~Lei, and
+  J.~Yang. Seg-Road: A segmentation network for road extraction based on transformer and CNN with
+  connectivity structures. \emph{Remote Sensing}, 15(6):1602, 2023.
+\bibitem{uroadnet2024} URoadNet: Dual sparse attentive U-Net for multiscale road network
+  extraction. arXiv:2412.17573, 2024.
+\bibitem{zhang2026dsfc} Z.~Zhang, Y.~Tian, W.~Xia, L.~Chen, Y.~Sun, K.~Ding, Y.~Wang, B.~Xu, and
+  S.~Xiang. DSFC-Net: A dual-encoder spatial and frequency co-awareness network for rural road
+  extraction. arXiv:2602.01278, 2026.
+\bibitem{williams2018} T.~Williams and R.~Li. Wavelet pooling for convolutional neural networks.
+  In \emph{ICLR}, 2018.
+\bibitem{li2020wavecnet} Q.~Li, L.~Shen, S.~Guo, and Z.~Lai. Wavelet integrated CNNs for
+  noise-robust image classification. In \emph{CVPR}, 2020.
+\bibitem{li2020wavesnet} Q.~Li and L.~Shen. WaveSNet: Wavelet integrated deep networks for image
+  segmentation. arXiv:2005.14461, 2020.
+\bibitem{xu2023hwd} G.~Xu, W.~Liao, X.~Zhang, C.~Li, X.~He, and X.~Wu. Haar wavelet downsampling:
+  A simple but effective downsampling module for semantic segmentation. \emph{Pattern
+  Recognition}, 143:109819, 2023.
+\bibitem{zong2025pwfnet} J.~Zong, Y.~Sun, R.~Wang, D.~Xu, X.~Yang, and X.~Zhao. PWFNet
+  (frequency-aware road extraction with pyramidal wavelet convolution). \emph{Remote Sensing},
+  17(16):2895, 2025. doi:10.3390/rs17162895.
 \end{thebibliography}
 
 \end{document}
