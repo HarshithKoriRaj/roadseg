@@ -31,7 +31,8 @@ PROJECT=/scratch/hk4488/roadseg
 CODE="${ROADSEG_CODE:-$PROJECT}"        # the frozen snapshot of scripts/launch.sh; default: live tree
 PY="${ROADSEG_PY:-/scratch/hk4488/.conda/envs/unsloth_sft/bin/python}"
 RUNS="${ROADSEG_RUNS:-$PROJECT/runs}"
-export ROADSEG_CODE="$CODE"
+CAMPAIGN="${ROADSEG_CAMPAIGN:-dwt}"     # geo: paper 2's GA/GB runs, analysed with --plan geo
+export ROADSEG_CODE="$CODE" ROADSEG_CAMPAIGN="$CAMPAIGN"
 export PYTHONPATH="$PROJECT/.deps:$CODE/src"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
@@ -56,8 +57,22 @@ while read -r _ _ _ _ name; do
     total=$(( total + 1 ))
     [[ -s "$RUNS/$name/test_metrics.json" ]] || missing+=("$name")
 done < <(bash "$CODE/scripts/sbatch_train_array.sh" --print-map)
-if (( total != 36 )); then
-    echo "AGGREGATE FAILED: the run map has $total entries, expected 36" >&2
+expected=36
+plan_args=()
+if [[ "$CAMPAIGN" == geo ]]; then
+    expected=12
+    plan_args=(--plan geo)
+    # its control: the first campaign's R0 runs
+    for dataset in massachusetts deepglobe; do
+        for seed in 0 1 2; do
+            total=$(( total + 1 ))
+            [[ -s "$RUNS/${dataset}_R0_s${seed}/test_metrics.json" ]] || missing+=("${dataset}_R0_s${seed}")
+        done
+    done
+    expected=18
+fi
+if (( total != expected )); then
+    echo "AGGREGATE FAILED: the run map has $total entries, expected $expected" >&2
     exit 1
 fi
 echo "scored runs: $(( total - ${#missing[@]} )) of $total"
@@ -73,9 +88,14 @@ status=0
 for dataset in massachusetts deepglobe; do
     echo "=== $dataset$( (( ${#missing[@]} )) && echo '  (INCOMPLETE: not all runs are scored, see above)') ==="
     if ! "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test \
-            ${stats_args[@]+"${stats_args[@]}"}; then
+            ${plan_args[@]+"${plan_args[@]}"} ${stats_args[@]+"${stats_args[@]}"}; then
         echo "AGGREGATE FAILED for $dataset" >&2
         status=1
+    fi
+    if [[ "$CAMPAIGN" == geo ]]; then
+        echo "--- $dataset: GB vs GA (secondary: the representation, supervision held fixed) ---"
+        "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test --plan geo \
+            --baseline GA ${stats_args[@]+"${stats_args[@]}"} || status=1
     fi
 done
 

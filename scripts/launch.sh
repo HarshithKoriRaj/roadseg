@@ -6,6 +6,7 @@
 #   bash scripts/launch.sh --smoke       # CPU rehearsal only (scripts/sbatch_smoke_cpu.sh, ~75 min)
 #   bash scripts/launch.sh --canary      # GPU canary only (scripts/sbatch_canary.sh, ~40 min)
 #   bash scripts/launch.sh               # the 36-task array + the aggregation job behind it
+#   bash scripts/launch.sh --campaign geo  # paper 2: the 12 GA/GB runs + their aggregation
 #
 # Every job kind runs from the same frozen snapshot, the rehearsal included: nothing that is
 # submitted here reads the working tree, so the tree may be edited while jobs run.
@@ -43,8 +44,16 @@ dry=0
 canary=0
 smoke=0
 smoke_check=1
+campaign=dwt
+expect_campaign=0
 for arg in "$@"; do
+    if (( expect_campaign )); then
+        campaign=$arg
+        expect_campaign=0
+        continue
+    fi
     case "$arg" in
+        --campaign) expect_campaign=1 ;;
         --dry-run) dry=1 ;;
         --canary) canary=1 ;;
         --smoke) smoke=1 ;;
@@ -53,6 +62,15 @@ for arg in "$@"; do
         *) echo "launch.sh: unknown argument '$arg' (see --help)" >&2; exit 2 ;;
     esac
 done
+if (( expect_campaign )); then
+    echo "launch.sh: --campaign needs a value (dwt or geo)" >&2
+    exit 2
+fi
+case "$campaign" in
+    dwt) ARRAY_ARGS=(); NTASKS=36 ;;
+    geo) ARRAY_ARGS=(--array=0-11%12); NTASKS=12 ;;
+    *) echo "launch.sh: unknown campaign '$campaign' (dwt or geo)" >&2; exit 2 ;;
+esac
 if (( smoke && canary )); then
     echo "launch.sh: give one of --smoke and --canary, not both (one job kind per launch)" >&2
     exit 2
@@ -124,7 +142,7 @@ for knob in $(compgen -e | grep -E '^(CANARY_|SMOKE_)' || true); do
     echo "launch.sh: not passing $knob to the job"
     unset "$knob"
 done
-EXPORT="--export=ALL,ROADSEG_CODE=$SNAP"
+EXPORT="--export=ALL,ROADSEG_CODE=$SNAP,ROADSEG_CAMPAIGN=$campaign"
 stamp=$(date +%Y-%m-%dT%H:%M:%S%z)
 
 # submit <label> <sbatch args...>  -> JOB = the job id (a placeholder in a dry run)
@@ -159,13 +177,13 @@ elif (( canary )); then
     echo "canary job: $jid   (log: $SLURM_LOGS/roadseg-canary_$jid.out; ends with 'CANARY: ALL PASSED')"
     line="$stamp sha=$sha snapshot=$SNAP canary=$jid"
 else
-    submit array "$EXPORT" "$SNAP/scripts/sbatch_train_array.sh"
+    submit array ${ARRAY_ARGS[@]+"${ARRAY_ARGS[@]}"} "$EXPORT" "$SNAP/scripts/sbatch_train_array.sh"
     jid=$JOB
     submit aggregate "--dependency=afterany:$jid" "$EXPORT" "$SNAP/scripts/sbatch_aggregate.sh"
     agg=$JOB
-    echo "array job: $jid   (36 tasks, 16 at a time; logs: $SLURM_LOGS/roadseg_${jid}_<task>.out)"
+    echo "array job: $jid   (campaign $campaign, $NTASKS tasks; logs: $SLURM_LOGS/roadseg_${jid}_<task>.out)"
     echo "aggregate job: $agg   (runs after every task of $jid has ended)"
-    line="$stamp sha=$sha snapshot=$SNAP array=$jid aggregate=$agg"
+    line="$stamp sha=$sha snapshot=$SNAP campaign=$campaign array=$jid aggregate=$agg"
 fi
 echo "code: $SNAP (commit $sha)"
 if (( ! dry )); then

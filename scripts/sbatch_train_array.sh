@@ -37,6 +37,13 @@
 #                                                          model   = (unet dlinknet)[(j / 3) % 2]
 #                                                          dataset = (massachusetts deepglobe)[j / 6]
 #
+# Campaign "geo" (paper 2; ROADSEG_CAMPAIGN=geo, set by `launch.sh --campaign geo`, which
+# also submits --array=0-11): the geometric-target rungs. Its control is the R0 runs above.
+#
+#    0-5    massachusetts   GA GA GA GB GB GB            seed    = i % 3
+#    6-11   deepglobe       GA GA GA GB GB GB            rung    = (GA GB)[(i / 3) % 2]
+#                                                        dataset = (massachusetts deepglobe)[i / 6]
+#
 # Signals. Both are forwarded to python as SIGTERM; train.py then checkpoints after the
 # current optimizer step and exits 75. What happens next depends on WHICH signal it was:
 #
@@ -65,7 +72,9 @@ PY="${ROADSEG_PY:-/scratch/hk4488/.conda/envs/unsloth_sft/bin/python}"
 RUNS="${ROADSEG_RUNS:-$PROJECT/runs}"
 LOGS="${ROADSEG_LOGS:-/scratch/hk4488/logs/roadseg}"
 
+CAMPAIGN="${ROADSEG_CAMPAIGN:-dwt}"
 RUNGS=(R0 R1 R2 R3)
+GEO_RUNGS=(GA GB)
 BASELINES=(unet dlinknet)
 DATASETS=(massachusetts deepglobe)
 SEEDS=(0 1 2)
@@ -73,6 +82,20 @@ SEEDS=(0 1 2)
 # map_index i -> DATASET, NAME, SEED, SELECT (the train.py flag pair that selects the model)
 map_index() {
     local i=$1
+    if [[ "$CAMPAIGN" == geo ]]; then
+        if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 11 )); then
+            echo "array index '$i' is outside 0-11 (campaign geo)" >&2
+            return 1
+        fi
+        SEED=${SEEDS[$(( i % 3 ))]}
+        NAME=${GEO_RUNGS[$(( (i / 3) % 2 ))]}
+        DATASET=${DATASETS[$(( i / 6 ))]}
+        SELECT=(--rung "$NAME")
+        return 0
+    elif [[ "$CAMPAIGN" != dwt ]]; then
+        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt or geo)" >&2
+        return 1
+    fi
     if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 35 )); then
         echo "array index '$i' is outside 0-35" >&2
         return 1
@@ -92,7 +115,9 @@ map_index() {
 }
 
 if [[ "${1:-}" == "--print-map" ]]; then
-    for i in $(seq 0 35); do
+    last=35
+    [[ "$CAMPAIGN" == geo ]] && last=11
+    for i in $(seq 0 "$last"); do
         map_index "$i"
         echo "$i $DATASET $NAME $SEED ${DATASET}_${NAME}_s${SEED}"
     done

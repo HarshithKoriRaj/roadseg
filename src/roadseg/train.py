@@ -67,7 +67,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from .data.dataset import RoadFullDataset, RoadTileDataset
 from .engine import load_checkpoint, save_checkpoint, train_one_epoch
 from .eval import evaluate, predict_full, resolve_device, select_threshold
-from .losses import ComboLoss
+from .data.geometry import RADII, geo_targets
+from .losses import ComboLoss, GeoLoss
 from .models.segmenter import build_model
 from .provenance import environment
 from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # noqa: F401
@@ -75,7 +76,11 @@ from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # no
                       code_identity, describe_code, run_cli, same_code, tmp_name)
 
 PROJECT = Path(__file__).resolve().parents[2]
-RUNGS = ("R0", "R1", "R2", "R3")
+RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB")
+GEO_RUNGS = ("GA", "GB")         # R0 + geometric targets (models/geo.py); paper 2
+# Added to the resolved config of a GEO rung only, so R0..R3 and the baselines resolve exactly
+# as they did in the first campaign.
+GEO_DEFAULTS = {"geo_radii": list(RADII), "geo_centre_weight": 1.0, "geo_width_weight": 1.0}
 BASELINES = ("unet", "dlinknet")
 DATASETS = ("massachusetts", "deepglobe")
 LR_FLOOR = 0.01                       # warmup starts at, and cosine decays to, LR_FLOOR * lr
@@ -187,6 +192,8 @@ def resolve_config(args, error=None) -> dict:
     else:
         fail(f"unknown model {model!r}; expected roadsegmenter or one of {list(BASELINES)}")
     cfg.update(model=model, rung=rung, name=name)
+    if rung in GEO_RUNGS:
+        cfg = {**GEO_DEFAULTS, **cfg}
     if cfg["dataset"] not in DATASETS:
         fail(f"unknown dataset {cfg['dataset']!r}; expected one of {list(DATASETS)}")
 
@@ -217,6 +224,14 @@ def config_diff(old: dict, new: dict) -> list[str]:
     keys = (set(old) | set(new)) - _RESUME_FREE
     return [f"{k}: {old.get(k)!r} -> {new.get(k)!r}" for k in sorted(keys)
             if old.get(k) != new.get(k)]
+
+
+def build_loss(cfg: dict):
+    """R3 = R2's loss (BCE + Dice) + cldice_weight * (1 - clDice); GA/GB = BCE + Dice on the
+    mask + the geometric terms (losses.GeoLoss); every other run BCE + Dice."""
+    if cfg["rung"] in GEO_RUNGS:
+        return GeoLoss(cfg["geo_centre_weight"], cfg["geo_width_weight"])
+    return ComboLoss(use_cldice=(cfg["rung"] == "R3"), cldice_weight=cfg["cldice_weight"])
 
 
 def set_seed(seed: int) -> None:
@@ -734,12 +749,17 @@ def preflight(cfg: dict, device: str, use_amp: bool) -> dict:
     if is_cuda:
         torch.cuda.reset_peak_memory_stats()
     model = build_model({**cfg, "pretrained": False}).to(device)
-    loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"), cldice_weight=cfg["cldice_weight"])
+    loss_fn = build_loss(cfg)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                                   weight_decay=cfg["weight_decay"])
     batches = [{"image": torch.randn(b, 3, t, t, generator=g),
                 "mask": (torch.rand(b, 1, t, t, generator=g) > 0.9).float(),
                 "valid": torch.ones(b, 1, t, t)} for _ in range(PREFLIGHT_STEPS)]
+    if cfg["rung"] in GEO_RUNGS:                   # the geometric targets of those masks
+        for batch in batches:
+            pairs = [geo_targets(m[0].numpy(), radii=cfg["geo_radii"]) for m in batch["mask"]]
+            batch["centre"] = torch.stack([torch.from_numpy(c) for c, _ in pairs]).unsqueeze(1)
+            batch["width"] = torch.stack([torch.from_numpy(w) for _, w in pairs])
     stamps = [time.monotonic()]
 
     def on_step(i: int, loss: float) -> None:
@@ -871,8 +891,7 @@ def main(argv=None) -> int:
     def build():
         set_seed(cfg["seed"])                  # immediately before build_model, nothing between
         model = build_model(cfg).to(device)
-        # R3 = R2's loss (BCE + Dice) + cldice_weight * (1 - clDice); nothing else differs
-        loss_fn = ComboLoss(use_cldice=(cfg["rung"] == "R3"), cldice_weight=cfg["cldice_weight"])
+        loss_fn = build_loss(cfg)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                                       weight_decay=cfg["weight_decay"])
         return model, loss_fn, optimizer
@@ -884,7 +903,7 @@ def main(argv=None) -> int:
                                     cfg["epochs"] * steps)
         n = sum(p.numel() for p in model.parameters())
         print(f"dry-run ok: {n / 1e6:.1f}M params, loss={type(loss_fn).__name__}"
-              f"(use_cldice={loss_fn.use_cldice}), {type(optimizer).__name__} "
+              f"(use_cldice={getattr(loss_fn, 'use_cldice', False)}), {type(optimizer).__name__} "
               f"lr={cfg['lr']} wd={cfg['weight_decay']}, {type(scheduler).__name__} "
               f"warmup_epochs={cfg['warmup_epochs']} epochs={cfg['epochs']}", flush=True)
         return EXIT_OK
@@ -961,7 +980,8 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
     try:
         data = dict(root=cfg["data_root"], dataset=cfg["dataset"])
         tile_kw = dict(split="train", tile=cfg["tile"], road_bias=cfg["road_bias"],
-                       limit=cfg["limit_train"], preload_workers=max(1, cfg["num_workers"]))
+                       limit=cfg["limit_train"], preload_workers=max(1, cfg["num_workers"]),
+                       geo_radii=cfg["geo_radii"] if cfg["rung"] in GEO_RUNGS else None)
         train_ds = RoadTileDataset(**data, **tile_kw, preload=False)          # index only
         steps_per_epoch = len(train_ds) // cfg["batch_size"]
         if cfg["max_train_batches"] is not None:

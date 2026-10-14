@@ -23,6 +23,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .geometry import geo_targets
 from .nodata import valid_mask
 from .prepare import build_index
 
@@ -161,12 +162,14 @@ class RoadTileDataset(_RowSource, Dataset):
     def __init__(self, root, dataset: str, split: str, tile: int = 512,
                  road_bias: float = 0.75, tries: int = 12, length: int | None = None,
                  augment: bool = True, preload: bool = False,
-                 preload_workers: int = 8, limit: int | None = None) -> None:
+                 preload_workers: int = 8, limit: int | None = None,
+                 geo_radii: tuple | None = None) -> None:
         if tries < 1:
             raise ValueError(f"tries must be >= 1, got {tries}")
         super().__init__(root, dataset, split, preload, preload_workers, limit)
         self.tile, self.road_bias, self.tries = tile, road_bias, tries
         self.augment = augment
+        self.geo_radii = None if geo_radii is None else tuple(geo_radii)
         self.length = length or len(self.rows) * 8
 
     def __len__(self) -> int:
@@ -192,11 +195,18 @@ class RoadTileDataset(_RowSource, Dataset):
         im, m, vv = img[y:y + t, x:x + t].copy(), m.astype(np.float32), vv.copy()
         if self.augment:
             im, m, vv = _augment(im, m, vv, g)
-        return {
+        out = {
             "image": torch.from_numpy(_normalize_chw(im)),
             "mask": torch.from_numpy(np.ascontiguousarray(m)).unsqueeze(0).float(),
             "valid": torch.from_numpy(vv.astype(np.float32)).unsqueeze(0),
         }
+        if self.geo_radii is not None:
+            # From the FINAL (augmented) crop mask, drawing no randomness: the crop stream is
+            # unchanged, and widths follow the crop's own rotation and scale.
+            centre, width = geo_targets(m, vv, radii=self.geo_radii)
+            out["centre"] = torch.from_numpy(centre).unsqueeze(0)
+            out["width"] = torch.from_numpy(width)
+        return out
 
 
 class RoadFullDataset(_RowSource, Dataset):

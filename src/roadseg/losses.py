@@ -145,3 +145,30 @@ class ComboLoss(nn.Module):
                 prob, target = prob * valid, target * valid
             loss = loss + self.cldice_weight * cl_dice_term(prob, target)
         return loss
+
+
+class GeoLoss(nn.Module):
+    """Loss of rungs GA and GB: R0's BCE + Dice on the mask, plus
+    `centre_weight` * (BCE + Dice) on the centre-line and `width_weight` * cross-entropy of
+    the width class at the centre-line pixels (targets: data.geometry.geo_targets).
+
+    Takes the model's `forward(x, aux=True)` dict. For GB the mask logits are logit(drawn
+    probability), so the mask term is the same BCE + Dice on the drawn mask. `geo = True`
+    tells engine.train_one_epoch to pass the geometric targets. fp32 throughout.
+    """
+
+    geo = True
+
+    def __init__(self, centre_weight: float = 1.0, width_weight: float = 1.0) -> None:
+        super().__init__()
+        self.combo = ComboLoss()
+        self.centre_weight, self.width_weight = centre_weight, width_weight
+
+    def forward(self, out: dict, target: torch.Tensor, valid: torch.Tensor | None,
+                centre: torch.Tensor, width: torch.Tensor) -> torch.Tensor:
+        loss = self.combo(out["mask"], target, valid)
+        loss = loss + self.centre_weight * self.combo(out["centre"], centre, valid)
+        logits = out["width"].float()
+        n = (width != -100).sum()
+        ce = F.cross_entropy(logits, width, ignore_index=-100, reduction="sum")
+        return loss + self.width_weight * ce / n.clamp_min(1)

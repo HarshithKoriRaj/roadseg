@@ -85,6 +85,43 @@ ANALYSIS_PLAN = {
 }
 
 
+# Paper 2 (geometric targets, rungs GA/GB). Fixed 2026-10-14, before any GA/GB run existed.
+# Its control is the first campaign's R0 runs (same recipe, seeds and crop stream; R0's code
+# path is unchanged -- see the spec). Selected with `--plan geo`; ANALYSIS_PLAN stays the
+# default and is not edited.
+GEO_ANALYSIS_PLAN = {
+    "status": "pre-specified: committed before any GA/GB run was trained or scored",
+    "primary": {
+        "comparison": "GB vs R0",
+        "rung": "GB",
+        "baseline": "R0",
+        "metric": "iou",
+        "metric_definition": "per-image IoU at the validation-selected threshold",
+        "split": "test",
+        "method": "two-level bootstrap (seeds within arm, then images), percentile interval",
+        "result": "vs_baseline.GB.two_level",
+        "n_boot": 10_000,
+        "seed": 0,
+        "alpha": 0.05,
+    },
+    "secondary": ("Everything else is SECONDARY / exploratory, reported without multiplicity "
+                  "correction: GA vs R0 (geometric supervision alone), GB vs GA (the drawn "
+                  "representation, supervision held fixed; computed with --baseline GA), the "
+                  "first campaign's rungs and baselines, other metrics (relaxed F1, clDice, "
+                  "APLS), pooled IoU, IoU@0.5 and the exclusions."),
+    "coverage_note": ANALYSIS_PLAN["coverage_note"],
+    "decision_rule": ("A difference between GB and R0 is claimed only if BOTH the two-level "
+                      "bootstrap interval and the seed-paired t interval exclude zero, with the "
+                      "same sign. If exactly one excludes zero, the result is reported as "
+                      "inconclusive at this number of seeds, and seeds 3 and 4 are run for R0 "
+                      "and GB before any claim. If neither excludes zero, the result is reported "
+                      "as no detected difference, with both intervals."),
+    "scope": ANALYSIS_PLAN["scope"],
+    "sensitivity": ANALYSIS_PLAN["sensitivity"],
+}
+PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN}
+
+
 def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:
     """ANALYSIS_PLAN["decision_rule"] applied to one comparison: (decision, decision_basis).
 
@@ -124,14 +161,15 @@ def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:
 
 
 def _plan_deviations(*, metric: str, split: str, baseline: str, n_boot: int, seed: int,
-                     allow_nonstandard: bool, compared: set[str]) -> list[str]:
+                     allow_nonstandard: bool, compared: set[str],
+                     plan: dict = ANALYSIS_PLAN) -> list[str]:
     """How this call differs from the pre-specified primary analysis ([] = it is that analysis).
 
     Any deviation means NO row of the output is the primary result: a table computed with
     another metric, split, baseline, replicate count or bootstrap seed, or one that admits
     non-standard-protocol runs, is a different analysis from the one that was fixed in advance.
     """
-    p = ANALYSIS_PLAN["primary"]
+    p = plan["primary"]
     got = {"metric": metric, "split": split, "baseline": baseline, "n_boot": n_boot, "seed": seed}
     dev = [f"{k}={v!r} (plan: {p[k]!r})" for k, v in got.items() if v != p[k]]
     if allow_nonstandard:
@@ -584,7 +622,7 @@ def _rung_images(name: str, seeds: list[int], rung_runs: dict, metric: str):
 
 def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "iou",
                    baseline: str = "R0", *, n_boot: int = 10_000, seed: int = 0,
-                   allow_nonstandard: bool = False) -> dict:
+                   allow_nonstandard: bool = False, plan: str = "dwt") -> dict:
     """Mean/std across seeds per rung, and each rung's difference from `baseline`.
 
     HEADLINE: `vs_baseline[rung]["two_level"]` (training-procedure estimand, includes
@@ -723,16 +761,18 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
         for analysis, why in skipped.items():
             skips.setdefault((analysis, why), []).append(rung)
     warns.extend(f"{analysis} skipped for {', '.join(rr)}: {why}" for (analysis, why), rr in skips.items())
-    plan = ANALYSIS_PLAN["primary"]
+    full_plan = PLANS[plan]
+    plan = full_plan["primary"]
     deviations = _plan_deviations(metric=metric, split=split, baseline=baseline, n_boot=n_boot,
-                                  seed=seed, allow_nonstandard=allow_nonstandard, compared=set(vs))
+                                  seed=seed, allow_nonstandard=allow_nonstandard, compared=set(vs),
+                                  plan=full_plan)
     if deviations:
         warns.append("no row here is the pre-specified primary analysis (" + plan["comparison"]
                      + "): " + "; ".join(deviations) + "; every comparison is secondary")
     for rung, v in vs.items():
         v["role"] = "primary" if rung == plan["rung"] and not deviations else "secondary"
     return {"dataset": dataset, "split": split, "metric": metric, "baseline": baseline,
-            "headline": "two_level", "analysis_plan": copy.deepcopy(ANALYSIS_PLAN),
+            "headline": "two_level", "analysis_plan": copy.deepcopy(full_plan),
             "primary": {"comparison": plan["comparison"], "result": plan["result"],
                         "conforms_to_plan": not deviations, "deviations": deviations},
             "rungs": rungs, "vs_baseline": vs, "warnings": warns}
@@ -846,13 +886,17 @@ def main(argv=None) -> int:
     ap.add_argument("--baseline", default="R0")
     ap.add_argument("--allow-nonstandard", action="store_true",
                     help="include runs scored with --limit / non-default tiling (smoke tests)")
+    ap.add_argument("--plan", choices=sorted(PLANS), default="dwt",
+                    help="which pre-specified analysis plan: dwt (paper 1, R1 vs R0) or geo "
+                         "(paper 2, GB vs R0); the geo summary is written to its own file")
     ap.add_argument("--json-only", action="store_true",
                     help="write the summary JSON and print only its path: no table "
                          "(warnings go to stderr)")
     a = ap.parse_args(argv)
     out = aggregate_runs(a.runs_dir, a.dataset, a.split, a.metric, a.baseline,
-                         allow_nonstandard=a.allow_nonstandard)
-    path = Path(a.runs_dir) / f"{a.dataset}_{a.split}_summary.json"
+                         allow_nonstandard=a.allow_nonstandard, plan=a.plan)
+    tag = "" if a.plan == "dwt" else f"_{a.plan}" + ("" if a.baseline == "R0" else f"_vs_{a.baseline}")
+    path = Path(a.runs_dir) / f"{a.dataset}_{a.split}{tag}_summary.json"
     path.write_text(json.dumps(out, indent=2))
     if a.json_only:
         for w in out["warnings"]:

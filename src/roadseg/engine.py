@@ -75,14 +75,19 @@ def train_one_epoch(model, loader, loss_fn, optimizer, use_amp: bool, device: st
     model.train()
     total, n = 0.0, 0
     device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    geo = getattr(loss_fn, "geo", False)    # rungs GA/GB: aux outputs + geometric targets
     for i, batch in enumerate(itertools.islice(loader, max_batches)):
         x = batch["image"].to(device, non_blocking=True)
         y = batch["mask"].to(device, non_blocking=True)
         v = batch["valid"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=bool(use_amp)):
-            logits = model(x)
-        loss = loss_fn(logits, y, v)       # outside autocast: fp32
+            logits = model(x, aux=True) if geo else model(x)
+        if geo:                            # outside autocast: fp32
+            loss = loss_fn(logits, y, v, batch["centre"].to(device, non_blocking=True),
+                           batch["width"].to(device, non_blocking=True))
+        else:
+            loss = loss_fn(logits, y, v)       # outside autocast: fp32
         value = float(loss.detach())
         if not math.isfinite(value):
             raise FloatingPointError(f"non-finite loss {value} at batch {i}")
