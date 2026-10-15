@@ -29,3 +29,10 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   [+0.0018, +0.0031] → inconclusive; GB − GA −0.0046 boot [−0.0087, −0.0008], t [−0.0083,
   −0.0008] (both exclude 0; secondary). APLS R0 .8047 / GA .8039 / GB .7990; clDice .8812 /
   .8828 / .8831. Tables: logs/roadseg/stats_massachusetts_geo{,_vs_GA}.txt.
+- 2026-10-15 13:30 CONFIRMATORY TEST REGISTERED BEFORE ANY DEEPGLOBE GA/GB RESULT WAS READ
+  (deepglobe_test_geo*_summary.json written 12:09 by aggregate 19841568, not opened): the
+  Massachusetts signal GA − R0 (+0.0024, t-only) is tested on DeepGlobe as a confirmatory
+  hypothesis: GA − R0 per-image test IoU, read from vs_baseline.GA in
+  deepglobe_test_geo_summary.json; same decision rule (both two-level bootstrap and seed-paired t
+  exclude 0 with the same sign = confirmed). Direction predicted: GA > R0. GB − R0 remains the
+  pre-specified primary.
