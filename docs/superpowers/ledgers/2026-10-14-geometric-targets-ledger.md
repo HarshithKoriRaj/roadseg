@@ -36,3 +36,11 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   deepglobe_test_geo_summary.json; same decision rule (both two-level bootstrap and seed-paired t
   exclude 0 with the same sign = confirmed). Direction predicted: GA > R0. GB − R0 remains the
   pre-specified primary.
+- 2026-10-15 13:31 DEEPGLOBE RESULT (aggregate 19841568, read after the registration above):
+  PRIMARY GB − R0 −0.0017 boot [−0.0059, +0.0028] t [−0.0129, +0.0095] → no_detected_difference.
+  CONFIRMATORY GA − R0 +0.0073 boot [+0.0033, +0.0118] t [+0.0011, +0.0135], per-seed
+  +0.0070 +0.0049 +0.0099 → CONFIRMED (predicted direction). Pooled IoU R0 .6771 → GA .6858
+  (+0.0087). GB − GA −0.0090 (both intervals exclude 0). APLS R0 .7755 / GA .7753 / GB .7588.
+  Summary across datasets: drawing the mask (GB) does not help and is worse than GA on both;
+  geometric auxiliary supervision (GA) helps on DeepGlobe (confirmed) and is inconclusive (+0.0024,
+  t-only) on Massachusetts. Full output: logs/roadseg/stats_geo_final_aggregate.txt.
