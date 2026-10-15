@@ -70,6 +70,18 @@ if [[ "$CAMPAIGN" == geo ]]; then
         done
     done
     expected=18
+elif [[ "$CAMPAIGN" == geo2 ]]; then
+    plan_args=(--plan geo2)
+    # its controls: seeds 0-2 of R0 and GA on both datasets (campaigns dwt and geo)
+    for dataset in massachusetts deepglobe; do
+        for name in R0 GA; do
+            for seed in 0 1 2; do
+                total=$(( total + 1 ))
+                [[ -s "$RUNS/${dataset}_${name}_s${seed}/test_metrics.json" ]] || missing+=("${dataset}_${name}_s${seed}")
+            done
+        done
+    done
+    expected=22
 fi
 if (( total != expected )); then
     echo "AGGREGATE FAILED: the run map has $total entries, expected $expected" >&2
@@ -91,6 +103,11 @@ for dataset in massachusetts deepglobe; do
             ${plan_args[@]+"${plan_args[@]}"} ${stats_args[@]+"${stats_args[@]}"}; then
         echo "AGGREGATE FAILED for $dataset" >&2
         status=1
+    fi
+    if [[ "$CAMPAIGN" == geo2 && "$dataset" == deepglobe ]]; then
+        echo "--- $dataset: GA vs its parts (secondary: GAc, GAw against GA) ---"
+        "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test --plan geo2 \
+            --baseline GA ${stats_args[@]+"${stats_args[@]}"} || status=1
     fi
     if [[ "$CAMPAIGN" == geo ]]; then
         echo "--- $dataset: GB vs GA (secondary: the representation, supervision held fixed) ---"

@@ -43,7 +43,7 @@ class RoadSegmenter(nn.Module):
 
 def build_model(cfg: dict) -> nn.Module:
     name = cfg.get("model", "roadsegmenter").lower()
-    if name == "roadsegmenter" and cfg.get("rung") in ("GA", "GB"):
+    if name == "roadsegmenter" and cfg.get("rung") in ("GA", "GB", "GAc", "GAw"):
         from .geo import GeoSegmenter
         from ..data.geometry import RADII
         return GeoSegmenter(cfg["rung"], radii=cfg.get("geo_radii", RADII),

@@ -277,3 +277,45 @@ def test_geo_plan_cli_writes_its_own_summary(tmp_path, capsys):
     assert not (tmp_path / "massachusetts_test_summary.json").exists()
     assert "GB vs R0" in capsys.readouterr().out
     assert json.loads((tmp_path / "massachusetts_test_geo_summary.json").read_text())["baseline"] == "R0"
+
+
+# ---------------------------------------------------------------- geo2: GA's attribution
+
+def test_gac_gaw_are_ga_with_one_loss_term_off():
+    ga, gac, gaw = _cfg("GA"), _cfg("GAc"), _cfg("GAw")
+    assert (gac["geo_centre_weight"], gac["geo_width_weight"]) == (1.0, 0.0)
+    assert (gaw["geo_centre_weight"], gaw["geo_width_weight"]) == (0.0, 1.0)
+    strip = lambda c: {k: v for k, v in c.items() if k not in ("rung", "name", "geo_centre_weight", "geo_width_weight")}
+    assert strip(ga) == strip(gac) == strip(gaw)
+    sds = []
+    for rung in ("GA", "GAc", "GAw"):
+        torch.manual_seed(11)
+        m = build_model({"rung": rung, "pretrained": False})
+        assert m.mode == "aux"
+        sds.append(m.state_dict())
+    assert all(torch.equal(sds[0][k], sd[k]) for sd in sds[1:] for k in sds[0])
+
+
+def test_a_switched_off_term_contributes_nothing():
+    b = _geo_batch()
+    torch.manual_seed(0)
+    out = {"mask": torch.randn(2, 1, 64, 64), "centre": torch.randn(2, 1, 64, 64),
+           "width": torch.randn(2, len(RADII), 64, 64)}
+    full = GeoLoss(1.0, 1.0)(out, b["mask"], b["valid"], b["centre"], b["width"])
+    c = GeoLoss(1.0, 0.0)(out, b["mask"], b["valid"], b["centre"], b["width"])
+    w = GeoLoss(0.0, 1.0)(out, b["mask"], b["valid"], b["centre"], b["width"])
+    mask_only = ComboLoss()(out["mask"], b["mask"], b["valid"])
+    assert torch.allclose(c + w - mask_only, full, atol=1e-6)
+
+
+def test_geo2_plan_is_primary_on_massachusetts_only(tmp_path):
+    for ds in ("massachusetts", "deepglobe"):
+        for s in range(5):
+            _write_run(tmp_path, "R0", s, [b + 0.001 * s for b in BASE], 0.6, dataset=ds)
+            _write_run(tmp_path, "GA", s, [b + 0.01 + 0.001 * s for b in BASE], 0.61, dataset=ds)
+    mass = stats.aggregate_runs(tmp_path, "massachusetts", plan="geo2")
+    assert mass["primary"]["conforms_to_plan"] and mass["vs_baseline"]["GA"]["role"] == "primary"
+    assert mass["rungs"]["GA"]["seeds"] == [0, 1, 2, 3, 4]
+    dg = stats.aggregate_runs(tmp_path, "deepglobe", plan="geo2")
+    assert not dg["primary"]["conforms_to_plan"] and dg["vs_baseline"]["GA"]["role"] == "secondary"
+    assert any("deepglobe" in d for d in dg["primary"]["deviations"])

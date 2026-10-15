@@ -119,7 +119,33 @@ GEO_ANALYSIS_PLAN = {
     "scope": ANALYSIS_PLAN["scope"],
     "sensitivity": ANALYSIS_PLAN["sensitivity"],
 }
-PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN}
+# Paper 2 follow-up (campaign geo2). Fixed 2026-10-15, before any geo2 run was trained.
+# Massachusetts: GA vs R0 was inconclusive at 3 seeds (only the seed-paired t interval excluded
+# zero), so -- as the decision rule requires -- seeds 3 and 4 are added for both arms and the
+# same test is repeated on seeds 0-4. DeepGlobe: GA vs R0 was confirmed (registered before it was
+# read); the attribution there is descriptive.
+GEO2_ANALYSIS_PLAN = {
+    "status": "pre-specified: committed before any geo2 run was trained or scored",
+    "primary": {**GEO_ANALYSIS_PLAN["primary"], "comparison": "GA vs R0 (Massachusetts, seeds 0-4)",
+                "rung": "GA", "result": "vs_baseline.GA.two_level", "datasets": ["massachusetts"]},
+    "secondary": ("SECONDARY / descriptive, no multiplicity correction: on DeepGlobe, GAc vs R0 and "
+                  "GAw vs R0 (GA with only the centre-line, or only the width loss term) and "
+                  "GAc, GAw vs GA (--baseline GA). Reading rule, fixed now: a term 'carries' GA's "
+                  "DeepGlobe gain if its rung vs R0 is a 'difference' (rule below) AND GA vs that "
+                  "rung is 'no_detected_difference'; if neither or both single-term rungs do, the "
+                  "gain is reported as needing both terms or as not attributable at 3 seeds. "
+                  "Everything else as in the geo plan."),
+    "coverage_note": ANALYSIS_PLAN["coverage_note"],
+    "decision_rule": ("A difference is claimed only if BOTH the two-level bootstrap interval and "
+                      "the seed-paired t interval exclude zero with the same sign; exactly one -> "
+                      "inconclusive; neither -> no detected difference. For the primary there is "
+                      "no further seed extension: at 5 seeds an inconclusive result is reported "
+                      "as such."),
+    "scope": ("The primary applies to Massachusetts only. Massachusetts uses seeds 0-4 for R0 and "
+              "GA; GB and the first campaign's rungs keep seeds 0-2."),
+    "sensitivity": ANALYSIS_PLAN["sensitivity"],
+}
+PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN, "geo2": GEO2_ANALYSIS_PLAN}
 
 
 def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:
@@ -162,7 +188,7 @@ def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:
 
 def _plan_deviations(*, metric: str, split: str, baseline: str, n_boot: int, seed: int,
                      allow_nonstandard: bool, compared: set[str],
-                     plan: dict = ANALYSIS_PLAN) -> list[str]:
+                     plan: dict = ANALYSIS_PLAN, dataset: str | None = None) -> list[str]:
     """How this call differs from the pre-specified primary analysis ([] = it is that analysis).
 
     Any deviation means NO row of the output is the primary result: a table computed with
@@ -174,6 +200,8 @@ def _plan_deviations(*, metric: str, split: str, baseline: str, n_boot: int, see
     dev = [f"{k}={v!r} (plan: {p[k]!r})" for k, v in got.items() if v != p[k]]
     if allow_nonstandard:
         dev.append("allow_nonstandard=True (plan: standard-protocol runs only)")
+    if dataset is not None and "datasets" in p and dataset not in p["datasets"]:
+        dev.append(f"dataset {dataset!r} (plan: primary on {p['datasets']} only)")
     if p["rung"] not in compared:
         dev.append(f"rung {p['rung']} is not among the compared rungs {sorted(compared)}")
     return dev
@@ -765,7 +793,7 @@ def aggregate_runs(runs_dir, dataset: str, split: str = "test", metric: str = "i
     plan = full_plan["primary"]
     deviations = _plan_deviations(metric=metric, split=split, baseline=baseline, n_boot=n_boot,
                                   seed=seed, allow_nonstandard=allow_nonstandard, compared=set(vs),
-                                  plan=full_plan)
+                                  plan=full_plan, dataset=dataset)
     if deviations:
         warns.append("no row here is the pre-specified primary analysis (" + plan["comparison"]
                      + "): " + "; ".join(deviations) + "; every comparison is secondary")

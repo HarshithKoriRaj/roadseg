@@ -76,8 +76,11 @@ from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # no
                       code_identity, describe_code, run_cli, same_code, tmp_name)
 
 PROJECT = Path(__file__).resolve().parents[2]
-RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB")
-GEO_RUNGS = ("GA", "GB")         # R0 + geometric targets (models/geo.py); paper 2
+RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB", "GAc", "GAw")
+GEO_RUNGS = ("GA", "GB", "GAc", "GAw")   # R0 + geometric targets (models/geo.py); paper 2
+# Attribution of GA (campaign geo2): the same model and targets as GA, one loss term switched
+# off -- GAc keeps only the centre-line term, GAw only the width term.
+GEO_RUNG_WEIGHTS = {"GAc": {"geo_width_weight": 0.0}, "GAw": {"geo_centre_weight": 0.0}}
 # Added to the resolved config of a GEO rung only, so R0..R3 and the baselines resolve exactly
 # as they did in the first campaign.
 GEO_DEFAULTS = {"geo_radii": list(RADII), "geo_centre_weight": 1.0, "geo_width_weight": 1.0}
@@ -193,7 +196,7 @@ def resolve_config(args, error=None) -> dict:
         fail(f"unknown model {model!r}; expected roadsegmenter or one of {list(BASELINES)}")
     cfg.update(model=model, rung=rung, name=name)
     if rung in GEO_RUNGS:
-        cfg = {**GEO_DEFAULTS, **cfg}
+        cfg = {**GEO_DEFAULTS, **GEO_RUNG_WEIGHTS.get(rung, {}), **cfg}
     if cfg["dataset"] not in DATASETS:
         fail(f"unknown dataset {cfg['dataset']!r}; expected one of {list(DATASETS)}")
 

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from ..data.geometry import RADII
 from .segmenter import RoadSegmenter
 
-GEO_RUNGS = {"GA": "aux", "GB": "render"}
+GEO_RUNGS = {"GA": "aux", "GB": "render", "GAc": "aux", "GAw": "aux"}   # GAc/GAw: GA, one loss term off
 EPS = 1e-4
 
 

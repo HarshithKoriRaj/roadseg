@@ -44,6 +44,14 @@
 #    6-11   deepglobe       GA GA GA GB GB GB            rung    = (GA GB)[(i / 3) % 2]
 #                                                        dataset = (massachusetts deepglobe)[i / 6]
 #
+# Campaign "geo2" (ROADSEG_CAMPAIGN=geo2, --array=0-9): seeds 3-4 of R0 and GA on Massachusetts
+# (the decision rule's follow-up of an inconclusive result) and GA's attribution on DeepGlobe.
+#
+#    0-1    massachusetts   R0 s3 s4
+#    2-3    massachusetts   GA s3 s4
+#    4-6    deepglobe       GAc s0 s1 s2                  (GA, centre-line loss term only)
+#    7-9    deepglobe       GAw s0 s1 s2                  (GA, width loss term only)
+#
 # Signals. Both are forwarded to python as SIGTERM; train.py then checkpoints after the
 # current optimizer step and exits 75. What happens next depends on WHICH signal it was:
 #
@@ -92,8 +100,20 @@ map_index() {
         DATASET=${DATASETS[$(( i / 6 ))]}
         SELECT=(--rung "$NAME")
         return 0
+    elif [[ "$CAMPAIGN" == geo2 ]]; then
+        local g2_data=(massachusetts massachusetts massachusetts massachusetts deepglobe deepglobe
+                       deepglobe deepglobe deepglobe deepglobe)
+        local g2_name=(R0 R0 GA GA GAc GAc GAc GAw GAw GAw)
+        local g2_seed=(3 4 3 4 0 1 2 0 1 2)
+        if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 9 )); then
+            echo "array index '$i' is outside 0-9 (campaign geo2)" >&2
+            return 1
+        fi
+        DATASET=${g2_data[$i]}; NAME=${g2_name[$i]}; SEED=${g2_seed[$i]}
+        SELECT=(--rung "$NAME")
+        return 0
     elif [[ "$CAMPAIGN" != dwt ]]; then
-        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt or geo)" >&2
+        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt, geo or geo2)" >&2
         return 1
     fi
     if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 35 )); then
@@ -117,6 +137,7 @@ map_index() {
 if [[ "${1:-}" == "--print-map" ]]; then
     last=35
     [[ "$CAMPAIGN" == geo ]] && last=11
+    [[ "$CAMPAIGN" == geo2 ]] && last=9
     for i in $(seq 0 "$last"); do
         map_index "$i"
         echo "$i $DATASET $NAME $SEED ${DATASET}_${NAME}_s${SEED}"
