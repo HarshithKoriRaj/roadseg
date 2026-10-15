@@ -21,3 +21,11 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
 - No GPU canary was run for GA/GB; each task's CUDA preflight (2 real optimizer steps with the
   geometric targets + one eval batch) runs first, and sentinels stop fresh runs after failures on
   two hosts. Watch `runs/PREFLIGHT_FAILED.*` and the first epoch times (DataLoader target cost).
+- 2026-10-15 11:10: Massachusetts 6/6 GA/GB done + test-scored (GA ~4.0 h, GB ~4.4 h; GB epoch
+  ~157 s vs GA 141 s). DeepGlobe: GA at epoch 38/40, GB at 34/40; no failures, no sentinels.
+- FIRST RESULT (Massachusetts, pre-specified plan, stats from releases/862387b):
+  PRIMARY GB − R0 per-image IoU −0.0021, boot [−0.0060, +0.0016], t [−0.0056, +0.0013] →
+  no_detected_difference. Secondary: GA − R0 +0.0024 boot [−0.0020, +0.0069] but t
+  [+0.0018, +0.0031] → inconclusive; GB − GA −0.0046 boot [−0.0087, −0.0008], t [−0.0083,
+  −0.0008] (both exclude 0; secondary). APLS R0 .8047 / GA .8039 / GB .7990; clDice .8812 /
+  .8828 / .8831. Tables: logs/roadseg/stats_massachusetts_geo{,_vs_GA}.txt.
