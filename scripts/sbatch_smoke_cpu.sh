@@ -55,7 +55,7 @@ for knob in SMOKE_DATASETS SMOKE_NAMES SMOKE_SEEDS SMOKE_TILE SMOKE_STEPS; do
     [[ -z "${!knob:-}" ]] || full=0
 done
 read -r -a DATASETS <<<"${SMOKE_DATASETS:-massachusetts deepglobe}"
-read -r -a NAMES <<<"${SMOKE_NAMES:-R0 R1 R2 R3 GA GB GAc GAw unet dlinknet}"
+read -r -a NAMES <<<"${SMOKE_NAMES:-R0 R1 R2 R3 GA GB GAc GAw GD GO unet dlinknet}"
 read -r -a SEEDS <<<"${SMOKE_SEEDS:-0 1}"
 TILE="${SMOKE_TILE:-256}"
 STRIDE=$(( TILE / 2 ))
@@ -70,7 +70,7 @@ export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
 step() { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 fail() { echo "SMOKE: FAILED - $*" >&2; exit 1; }
-select_flag() { if [[ "$1" == R[0-9] || "$1" == G[AB]* ]]; then echo "--rung $1"; else echo "--model $1"; fi; }
+select_flag() { if [[ "$1" == R[0-9] || "$1" == G* ]]; then echo "--rung $1"; else echo "--model $1"; fi; }
 section() { [[ "$STEPS" == *" $1 "* ]]; }
 
 # code_sha: the commit this rehearsal runs. A frozen snapshot names it in COMMIT. In a working

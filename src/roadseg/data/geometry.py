@@ -102,3 +102,75 @@ def geo_targets(mask: np.ndarray, valid: np.ndarray | None = None,
     keep = pts if valid is None else pts & np.asarray(valid, bool)
     width[keep] = depth[keep]
     return centre, width
+
+
+# ---------------------------------------------------------------- baselines (campaign geo3)
+# Prior auxiliary targets, built on the same pipeline so only the target differs from GA.
+
+DDT_CLASSES = 20         # GD: round(EDT) in 1..20+ -> classes 0..19 (Wang et al., CVPR 2020)
+ORIENT_BINS = 18         # GO: undirected road direction in 10-degree bins, + background class 0
+
+
+def ddt_targets(mask: np.ndarray, valid: np.ndarray | None = None,
+                n_classes: int = DDT_CLASSES) -> np.ndarray:
+    """Deep Distance Transform targets: at EVERY road pixel, the Euclidean distance to the
+    nearest background pixel rounded to an integer and used as a class ("scale class");
+    IGNORE off the road and on no-data pixels. Edge-padded like geo_targets."""
+    b = np.asarray(mask) > 0.5
+    h, w = b.shape
+    width = np.full((h, w), IGNORE, np.int64)
+    if not b.any():
+        return width
+    edt = ndi.distance_transform_edt(np.pad(b, PAD, mode="edge"))[PAD:PAD + h, PAD:PAD + w]
+    cls = np.clip(np.rint(edt).astype(np.int64) - 1, 0, n_classes - 1)
+    keep = b if valid is None else b & np.asarray(valid, bool)
+    width[keep] = cls[keep]
+    return width
+
+
+def orientation_targets(mask: np.ndarray, valid: np.ndarray | None = None,
+                        n_bins: int = ORIENT_BINS) -> np.ndarray:
+    """Road-orientation targets in the spirit of Batra et al. (CVPR 2019), from the mask: the
+    undirected direction of the centre-line (structure tensor of the blurred skeleton) at the
+    nearest skeleton pixel, in `n_bins` bins over [0, 180) degrees as classes 1..n_bins;
+    background pixels are class 0 (supervised, as in Batra); no-data pixels IGNORE.
+    Angles are in image coordinates (x right, y down)."""
+    b = np.asarray(mask) > 0.5
+    h, w = b.shape
+    out = np.zeros((h, w), np.int64)
+    if b.any():
+        p = np.pad(b, PAD, mode="edge")
+        sk = skeletonize(p)
+        s = ndi.gaussian_filter(sk.astype(np.float64), 1.5)
+        gy, gx = np.gradient(s)
+        jxx = ndi.gaussian_filter(gx * gx, 3.0)
+        jyy = ndi.gaussian_filter(gy * gy, 3.0)
+        jxy = ndi.gaussian_filter(gx * gy, 3.0)
+        grad = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy)     # dominant gradient direction
+        road = np.mod(grad + np.pi / 2.0, np.pi)          # the road runs across it
+        if sk.any():
+            _, (iy, ix) = ndi.distance_transform_edt(~sk, return_indices=True)
+            road = road[iy, ix]
+        bins = np.minimum((road / np.pi * n_bins).astype(np.int64), n_bins - 1) + 1
+        crop = (slice(PAD, PAD + h), slice(PAD, PAD + w))
+        out[b] = bins[crop][b]
+    if valid is not None:
+        out[~np.asarray(valid, bool)] = IGNORE
+    return out
+
+
+TARGET_KINDS = ("cover", "ddt", "orient")
+
+
+def targets_for(kind: str, mask: np.ndarray, valid: np.ndarray | None = None,
+                radii=RADII) -> tuple[np.ndarray, np.ndarray]:
+    """(centre, class map) for a rung's target kind. Only "cover" (GA/GB/GAc/GAw) has a
+    centre target; the baselines' centre map is all zero (their centre loss weight is 0)."""
+    if kind == "cover":
+        return geo_targets(mask, valid, radii=radii)
+    zero = np.zeros(np.asarray(mask).shape, np.float32)
+    if kind == "ddt":
+        return zero, ddt_targets(mask, valid)
+    if kind == "orient":
+        return zero, orientation_targets(mask, valid)
+    raise ValueError(f"unknown target kind {kind!r}; expected one of {TARGET_KINDS}")

@@ -23,7 +23,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .geometry import geo_targets
+from .geometry import targets_for
 from .nodata import valid_mask
 from .prepare import build_index
 
@@ -163,13 +163,14 @@ class RoadTileDataset(_RowSource, Dataset):
                  road_bias: float = 0.75, tries: int = 12, length: int | None = None,
                  augment: bool = True, preload: bool = False,
                  preload_workers: int = 8, limit: int | None = None,
-                 geo_radii: tuple | None = None) -> None:
+                 geo_radii: tuple | None = None, geo_kind: str = "cover") -> None:
         if tries < 1:
             raise ValueError(f"tries must be >= 1, got {tries}")
         super().__init__(root, dataset, split, preload, preload_workers, limit)
         self.tile, self.road_bias, self.tries = tile, road_bias, tries
         self.augment = augment
         self.geo_radii = None if geo_radii is None else tuple(geo_radii)
+        self.geo_kind = geo_kind
         self.length = length or len(self.rows) * 8
 
     def __len__(self) -> int:
@@ -203,7 +204,7 @@ class RoadTileDataset(_RowSource, Dataset):
         if self.geo_radii is not None:
             # From the FINAL (augmented) crop mask, drawing no randomness: the crop stream is
             # unchanged, and widths follow the crop's own rotation and scale.
-            centre, width = geo_targets(m, vv, radii=self.geo_radii)
+            centre, width = targets_for(self.geo_kind, m, vv, radii=self.geo_radii)
             out["centre"] = torch.from_numpy(centre).unsqueeze(0)
             out["width"] = torch.from_numpy(width)
         return out

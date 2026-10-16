@@ -145,7 +145,33 @@ GEO2_ANALYSIS_PLAN = {
               "GA; GB and the first campaign's rungs keep seeds 0-2."),
     "sensitivity": ANALYSIS_PLAN["sensitivity"],
 }
-PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN, "geo2": GEO2_ANALYSIS_PLAN}
+# Paper 2 baselines (campaign geo3). Fixed 2026-10-16, before any geo3 run was trained. The
+# literature search found Deep Distance Transform (Wang et al., CVPR 2020): a segmentation head
+# plus quantized distance-transform "scale classes" at every foreground pixel -- the closest
+# prior to GA. GD puts DDT's targets on GA's model, GO road orientation (Batra et al., CVPR 2019).
+GEO3_ANALYSIS_PLAN = {
+    "status": "pre-specified: committed before any geo3 run was trained or scored",
+    "primary": {**GEO_ANALYSIS_PLAN["primary"], "comparison": "GA vs GD (DeepGlobe)",
+                "rung": "GA", "baseline": "GD", "result": "vs_baseline.GA.two_level",
+                "datasets": ["deepglobe"]},
+    "secondary": ("SECONDARY / descriptive, no multiplicity correction: GD vs R0 and GO vs R0 (does a "
+                  "prior auxiliary target help at all, on this pipeline), GA vs GO (--baseline GO is "
+                  "not run; read GO from the GA-baseline table with the sign flipped), and the "
+                  "earlier rungs. Reading: if GA vs GD is a 'difference' with GA ahead, the "
+                  "disc-cover width targets are a contribution over DDT's; if 'no detected "
+                  "difference', the contribution is the controlled finding (auxiliary scale "
+                  "supervision helps roads, drawing the mask does not), not the target encoding; if "
+                  "GD is ahead, DDT's targets are preferred and the paper says so."),
+    "coverage_note": ANALYSIS_PLAN["coverage_note"],
+    "decision_rule": GEO2_ANALYSIS_PLAN["decision_rule"].replace(
+        "For the primary there is no further seed extension: at 5 seeds an inconclusive result is "
+        "reported as such.",
+        "If the primary is inconclusive, seeds 3 and 4 are run for GA and GD before any claim."),
+    "scope": "DeepGlobe only (3 seeds per arm).",
+    "sensitivity": ANALYSIS_PLAN["sensitivity"],
+}
+PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN, "geo2": GEO2_ANALYSIS_PLAN,
+         "geo3": GEO3_ANALYSIS_PLAN}
 
 
 def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:

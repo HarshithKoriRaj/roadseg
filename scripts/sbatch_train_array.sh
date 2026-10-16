@@ -52,6 +52,11 @@
 #    4-6    deepglobe       GAc s0 s1 s2                  (GA, centre-line loss term only)
 #    7-9    deepglobe       GAw s0 s1 s2                  (GA, width loss term only)
 #
+# Campaign "geo3" (ROADSEG_CAMPAIGN=geo3, --array=0-5): prior auxiliary targets on GA's model.
+#
+#    0-2    deepglobe       GD s0 s1 s2                   (Deep Distance Transform scale classes)
+#    3-5    deepglobe       GO s0 s1 s2                   (road orientation, Batra et al.)
+#
 # Signals. Both are forwarded to python as SIGTERM; train.py then checkpoints after the
 # current optimizer step and exits 75. What happens next depends on WHICH signal it was:
 #
@@ -112,8 +117,17 @@ map_index() {
         DATASET=${g2_data[$i]}; NAME=${g2_name[$i]}; SEED=${g2_seed[$i]}
         SELECT=(--rung "$NAME")
         return 0
+    elif [[ "$CAMPAIGN" == geo3 ]]; then
+        if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 5 )); then
+            echo "array index '$i' is outside 0-5 (campaign geo3)" >&2
+            return 1
+        fi
+        local g3_name=(GD GO)
+        DATASET=deepglobe; NAME=${g3_name[$(( i / 3 ))]}; SEED=$(( i % 3 ))
+        SELECT=(--rung "$NAME")
+        return 0
     elif [[ "$CAMPAIGN" != dwt ]]; then
-        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt, geo or geo2)" >&2
+        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt, geo, geo2 or geo3)" >&2
         return 1
     fi
     if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 35 )); then
@@ -138,6 +152,7 @@ if [[ "${1:-}" == "--print-map" ]]; then
     last=35
     [[ "$CAMPAIGN" == geo ]] && last=11
     [[ "$CAMPAIGN" == geo2 ]] && last=9
+    [[ "$CAMPAIGN" == geo3 ]] && last=5
     for i in $(seq 0 "$last"); do
         map_index "$i"
         echo "$i $DATASET $NAME $SEED ${DATASET}_${NAME}_s${SEED}"

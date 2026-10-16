@@ -54,7 +54,7 @@ export OMP_NUM_THREADS="${CANARY_THREADS:-1}"
 
 step() { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 fail() { echo "CANARY: FAILED - $*" >&2; exit 1; }
-select_flag() { if [[ "$1" == R[0-9] || "$1" == G[AB]* ]]; then echo "--rung $1"; else echo "--model $1"; fi; }
+select_flag() { if [[ "$1" == R[0-9] || "$1" == G* ]]; then echo "--rung $1"; else echo "--model $1"; fi; }
 
 [[ "$(basename "$RUNS")" == *canary* ]] || fail "refusing to wipe '$RUNS': not a canary directory"
 [[ -d "$CODE/src/roadseg" ]] || fail "no code at ROADSEG_CODE=$CODE"

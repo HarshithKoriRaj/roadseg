@@ -3197,3 +3197,21 @@ def test_launch_geo2_campaign_submits_10_tasks(tmp_path):
     assert rc == 0, out + err
     assert (f"--parsable --array=0-9%10 --export=ALL,ROADSEG_CODE={snap},ROADSEG_CAMPAIGN=geo2 "
             f"{snap}/scripts/sbatch_train_array.sh") in out and calls == []
+
+
+def test_array_map_of_the_geo3_campaign():
+    import subprocess
+    out = subprocess.run(["bash", str(ROOT / "scripts/sbatch_train_array.sh"), "--print-map"],
+                         env={"PATH": "/usr/bin:/bin", "ROADSEG_CAMPAIGN": "geo3"},
+                         capture_output=True, text=True, check=True).stdout.split("\n")
+    names = [line.split()[-1] for line in out if line.strip()]
+    assert names == [f"deepglobe_{r}_s{s}" for r in ("GD", "GO") for s in (0, 1, 2)]
+
+
+def test_launch_geo3_campaign_submits_6_tasks(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    snap = repo / "releases" / short
+    rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", "--campaign", "geo3", smoke=sha)
+    assert rc == 0, out + err
+    assert (f"--parsable --array=0-5%6 --export=ALL,ROADSEG_CODE={snap},ROADSEG_CAMPAIGN=geo3 "
+            f"{snap}/scripts/sbatch_train_array.sh") in out and calls == []

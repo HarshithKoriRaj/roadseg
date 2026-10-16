@@ -67,7 +67,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from .data.dataset import RoadFullDataset, RoadTileDataset
 from .engine import load_checkpoint, save_checkpoint, train_one_epoch
 from .eval import evaluate, predict_full, resolve_device, select_threshold
-from .data.geometry import RADII, geo_targets
+from .data.geometry import DDT_CLASSES, ORIENT_BINS, RADII, targets_for
 from .losses import ComboLoss, GeoLoss
 from .models.segmenter import build_model
 from .provenance import environment
@@ -76,11 +76,17 @@ from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # no
                       code_identity, describe_code, run_cli, same_code, tmp_name)
 
 PROJECT = Path(__file__).resolve().parents[2]
-RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB", "GAc", "GAw")
-GEO_RUNGS = ("GA", "GB", "GAc", "GAw")   # R0 + geometric targets (models/geo.py); paper 2
+RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB", "GAc", "GAw", "GD", "GO")
+GEO_RUNGS = ("GA", "GB", "GAc", "GAw", "GD", "GO")   # R0 + geometric targets (models/geo.py); paper 2
 # Attribution of GA (campaign geo2): the same model and targets as GA, one loss term switched
 # off -- GAc keeps only the centre-line term, GAw only the width term.
-GEO_RUNG_WEIGHTS = {"GAc": {"geo_width_weight": 0.0}, "GAw": {"geo_centre_weight": 0.0}}
+GEO_RUNG_WEIGHTS = {"GAc": {"geo_width_weight": 0.0}, "GAw": {"geo_centre_weight": 0.0},
+                    # Baselines (campaign geo3): GA's model and loss, a prior target in the class
+                    # head and no centre-line term. GD = Deep Distance Transform scale classes,
+                    # GO = road orientation (Batra et al.) + background.
+                    "GD": {"geo_centre_weight": 0.0, "geo_targets": "ddt", "geo_n_classes": DDT_CLASSES},
+                    "GO": {"geo_centre_weight": 0.0, "geo_targets": "orient",
+                           "geo_n_classes": ORIENT_BINS + 1}}
 # Added to the resolved config of a GEO rung only, so R0..R3 and the baselines resolve exactly
 # as they did in the first campaign.
 GEO_DEFAULTS = {"geo_radii": list(RADII), "geo_centre_weight": 1.0, "geo_width_weight": 1.0}
@@ -760,7 +766,8 @@ def preflight(cfg: dict, device: str, use_amp: bool) -> dict:
                 "valid": torch.ones(b, 1, t, t)} for _ in range(PREFLIGHT_STEPS)]
     if cfg["rung"] in GEO_RUNGS:                   # the geometric targets of those masks
         for batch in batches:
-            pairs = [geo_targets(m[0].numpy(), radii=cfg["geo_radii"]) for m in batch["mask"]]
+            pairs = [targets_for(cfg.get("geo_targets", "cover"), m[0].numpy(), radii=cfg["geo_radii"])
+                     for m in batch["mask"]]
             batch["centre"] = torch.stack([torch.from_numpy(c) for c, _ in pairs]).unsqueeze(1)
             batch["width"] = torch.stack([torch.from_numpy(w) for _, w in pairs])
     stamps = [time.monotonic()]
@@ -984,7 +991,8 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
         data = dict(root=cfg["data_root"], dataset=cfg["dataset"])
         tile_kw = dict(split="train", tile=cfg["tile"], road_bias=cfg["road_bias"],
                        limit=cfg["limit_train"], preload_workers=max(1, cfg["num_workers"]),
-                       geo_radii=cfg["geo_radii"] if cfg["rung"] in GEO_RUNGS else None)
+                       geo_radii=cfg["geo_radii"] if cfg["rung"] in GEO_RUNGS else None,
+                       geo_kind=cfg.get("geo_targets", "cover"))
         train_ds = RoadTileDataset(**data, **tile_kw, preload=False)          # index only
         steps_per_epoch = len(train_ds) // cfg["batch_size"]
         if cfg["max_train_batches"] is not None:

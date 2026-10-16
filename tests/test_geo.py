@@ -319,3 +319,95 @@ def test_geo2_plan_is_primary_on_massachusetts_only(tmp_path):
     dg = stats.aggregate_runs(tmp_path, "deepglobe", plan="geo2")
     assert not dg["primary"]["conforms_to_plan"] and dg["vs_baseline"]["GA"]["role"] == "secondary"
     assert any("deepglobe" in d for d in dg["primary"]["deviations"])
+
+
+# ---------------------------------------------------------------- geo3: prior-target baselines
+
+from roadseg.data.geometry import DDT_CLASSES, ORIENT_BINS, ddt_targets, orientation_targets, targets_for
+
+
+@pytest.mark.parametrize("r", [0, 2, 5])
+def test_ddt_targets_are_rounded_distance_classes_on_every_road_pixel(r):
+    m = np.zeros((64, 64), bool); m[30 - r:31 + r, :] = True
+    w = ddt_targets(m)
+    assert (w[~m] == IGNORE).all() and (w[m] != IGNORE).all()
+    assert w[30, 10] == r                       # axis: EDT r + 1 -> class r
+    assert w[30 - r, 10] == 0                   # edge row: EDT 1 -> class 0
+    assert w.max() < DDT_CLASSES
+
+
+@pytest.mark.parametrize("orient,expected", [("h", 1), ("v", ORIENT_BINS // 2 + 1)])
+def test_orientation_targets_of_straight_roads(orient, expected):
+    m = np.zeros((96, 96), bool)
+    if orient == "h":
+        m[46:51, :] = True
+    else:
+        m[:, 46:51] = True
+    o = orientation_targets(m)
+    assert (o[~m] == 0).all()
+    vals, counts = np.unique(o[m], return_counts=True)
+    assert vals[np.argmax(counts)] == expected
+    assert counts.max() / m.sum() > 0.95
+
+
+def test_diagonal_road_orientation_and_no_data():
+    yy, xx = np.mgrid[:96, :96]
+    m = np.abs(yy - xx) <= 2                    # y = x in image coords: 45 degrees
+    o = orientation_targets(m)
+    vals, counts = np.unique(o[m], return_counts=True)
+    assert vals[np.argmax(counts)] in (ORIENT_BINS // 4, ORIENT_BINS // 4 + 1, 3 * ORIENT_BINS // 4, 3 * ORIENT_BINS // 4 + 1)
+    valid = np.ones_like(m); valid[:, :20] = False
+    assert (orientation_targets(m, valid)[:, :20] == IGNORE).all()
+
+
+@pytest.mark.parametrize("rung,kind,n", [("GD", "ddt", DDT_CLASSES), ("GO", "orient", ORIENT_BINS + 1)])
+def test_baseline_rungs_config_model_and_one_step(rung, kind, n):
+    c = _cfg(rung)
+    assert c["geo_targets"] == kind and c["geo_n_classes"] == n and c["geo_centre_weight"] == 0.0
+    ga = _cfg("GA")
+    strip = lambda d: {k: v for k, v in d.items() if not k.startswith("geo_") and k not in ("rung", "name")}
+    assert strip(c) == strip(ga) and "geo_targets" not in ga
+    torch.manual_seed(2)
+    m = build_model(c | {"pretrained": False})
+    assert m.width_head.out_channels == n and m.mode == "aux"
+    torch.manual_seed(2)
+    r0 = RoadSegmenter("R0", pretrained=False).state_dict()
+    sd = m.state_dict()
+    assert all(torch.equal(sd[k], v) for k, v in r0.items())
+    b = _geo_batch()
+    pairs = [targets_for(kind, mm[0].numpy()) for mm in b["mask"]]
+    b["centre"] = torch.stack([torch.from_numpy(x) for x, _ in pairs]).unsqueeze(1)
+    b["width"] = torch.stack([torch.from_numpy(y) for _, y in pairs])
+    assert int(b["width"].max()) < n
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    loss = train_one_epoch(m, [b], train.build_loss(c), opt, use_amp=False, device="cpu", max_batches=1)
+    assert np.isfinite(loss)
+
+
+@pytest.mark.parametrize("kind", ["ddt", "orient"])
+def test_baseline_targets_do_not_change_the_crop_stream(tmp_path, kind):
+    root = _fake_deepglobe(tmp_path)
+    plain = RoadTileDataset(root, "deepglobe", "train", tile=96)
+    geo = RoadTileDataset(root, "deepglobe", "train", tile=96, geo_radii=RADII, geo_kind=kind)
+    for seed in range(4):
+        torch.manual_seed(seed); a = plain[0]
+        torch.manual_seed(seed); b = geo[0]
+        for k in ("image", "mask", "valid"):
+            assert torch.equal(a[k], b[k]), (seed, k)
+        assert b["centre"].sum() == 0
+
+
+def test_existing_ga_runs_build_unchanged():
+    """A GA metrics.json cfg has no geo_n_classes / geo_targets: it must still build GA."""
+    m = build_model({"rung": "GA", "pretrained": False, "geo_radii": list(RADII)})
+    assert m.width_head.out_channels == len(RADII)
+
+
+def test_geo3_plan_primary_is_ga_vs_gd_on_deepglobe(tmp_path):
+    for s in range(3):
+        for rung, d in (("R0", 0.0), ("GA", 0.01), ("GD", 0.005), ("GO", 0.002)):
+            _write_run(tmp_path, rung, s, [b + d + 0.001 * s for b in BASE], 0.6, dataset="deepglobe")
+    out = stats.aggregate_runs(tmp_path, "deepglobe", baseline="GD", plan="geo3")
+    assert out["primary"]["conforms_to_plan"] and out["vs_baseline"]["GA"]["role"] == "primary"
+    vs_r0 = stats.aggregate_runs(tmp_path, "deepglobe", plan="geo3")
+    assert not vs_r0["primary"]["conforms_to_plan"]

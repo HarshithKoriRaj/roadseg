@@ -21,7 +21,8 @@ import torch.nn.functional as F
 from ..data.geometry import RADII
 from .segmenter import RoadSegmenter
 
-GEO_RUNGS = {"GA": "aux", "GB": "render", "GAc": "aux", "GAw": "aux"}   # GAc/GAw: GA, one loss term off
+GEO_RUNGS = {"GA": "aux", "GB": "render", "GAc": "aux", "GAw": "aux",   # GAc/GAw: GA, one loss term off
+             "GD": "aux", "GO": "aux"}       # GD/GO: GA's model with prior targets (DDT, orientation)
 EPS = 1e-4
 
 
@@ -58,7 +59,8 @@ def render(contrib: torch.Tensor, radii=RADII) -> torch.Tensor:
 
 
 class GeoSegmenter(RoadSegmenter):
-    def __init__(self, rung: str, radii=RADII, pretrained: bool = True) -> None:
+    def __init__(self, rung: str, radii=RADII, pretrained: bool = True,
+                 n_classes: int | None = None) -> None:
         if rung not in GEO_RUNGS:
             raise ValueError(f"unknown geometric rung {rung!r}; expected one of {list(GEO_RUNGS)}")
         # R0's decoder, mask head and encoder, built in R0's order: at the same seed they are
@@ -66,7 +68,10 @@ class GeoSegmenter(RoadSegmenter):
         super().__init__(rung="R0", pretrained=pretrained)
         self.rung, self.mode, self.radii = rung, GEO_RUNGS[rung], tuple(int(r) for r in radii)
         self.centre_head = nn.Conv2d(32, 1, 1)
-        self.width_head = nn.Conv2d(32, len(self.radii), 1)
+        # class head: width classes (GA/GB), or a baseline's classes (GD: DDT scales, GO: angles)
+        self.width_head = nn.Conv2d(32, n_classes or len(self.radii), 1)
+        if self.mode == "render" and self.width_head.out_channels != len(self.radii):
+            raise ValueError("render needs one class per radius")
 
     def forward(self, x: torch.Tensor, aux: bool = False):
         h, w = x.shape[-2:]
