@@ -55,3 +55,13 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   R0's errors on Massachusetts, 51% on DeepGlobe. GA vs R0 on DeepGlobe: TP +0.1%, FN ≈ −0.6%,
   FP near −6.1%, FP far −7.2% → GA's gain is almost entirely FEWER FALSE POSITIVES (recall by
   width unchanged). GB: FN edge −5.8% but FP near +4.6% (draws roads wider), FN interior +1.5%.
+- 2026-10-16 geo2 COMPLETE (array 20012726 10/10, 0 failures; aggregate 20012727). Read 11:25.
+  PRIMARY (geo2 plan) Massachusetts GA − R0, seeds 0–4: +0.0027 boot [−0.0012, +0.0068], t
+  [−0.0008, +0.0061], per-seed +0.0024 +0.0027 +0.0022 −0.0010 +0.0069 → no_detected_difference
+  (no further extension, per plan). Pooled R0 .6556 / GA .6588 (5 seeds).
+  DeepGlobe attribution (descriptive, reading rule fixed in the plan): GAc − R0 +0.0005 → no
+  difference; GAw − R0 +0.0043 boot [+0.0002, +0.0088] t [−0.0013, +0.0098] → inconclusive;
+  GA − GAc +0.0068 and GA − GAw +0.0030, both "difference". Neither single term carries the gain
+  by the rule → reported as NEEDING BOTH TERMS; the width term contributes most (pooled GAw
+  .6849 vs GA .6858 vs R0 .6771), centre-line term alone ~0. Output:
+  logs/roadseg/stats_geo2_final_aggregate.txt.
