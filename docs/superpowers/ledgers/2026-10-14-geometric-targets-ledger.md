@@ -44,3 +44,14 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   Summary across datasets: drawing the mask (GB) does not help and is worse than GA on both;
   geometric auxiliary supervision (GA) helps on DeepGlobe (confirmed) and is inconclusive (+0.0024,
   t-only) on Massachusetts. Full output: logs/roadseg/stats_geo_final_aggregate.txt.
+- 2026-10-15 geo2 prepared: commit a6cc48b (GAc/GAw rungs, campaign geo2, GEO2_ANALYSIS_PLAN
+  committed before any geo2 run). Suite 19963973: 497 passed. Rehearsal 19963975: ALL PASSED,
+  SMOKE_PASSED = a6cc48b. Session dropped before launch (~6 h idle).
+- **LAUNCHED 2026-10-15 23:21: array 20012726 (10 tasks, campaign geo2), aggregate 20012727,
+  snapshot releases/a6cc48b** (rehearsal check enforced, not overridden).
+- Error breakdown (descriptive, saved test probs at each run's validation threshold; job
+  19964515, scripts/analysis/error_breakdown.py, logs/roadseg/geo_error_breakdown.json); pooled IoU
+  reproduces the scored values exactly. Edge/near pixels (≤ 2 px of the GT boundary) are 69% of
+  R0's errors on Massachusetts, 51% on DeepGlobe. GA vs R0 on DeepGlobe: TP +0.1%, FN ≈ −0.6%,
+  FP near −6.1%, FP far −7.2% → GA's gain is almost entirely FEWER FALSE POSITIVES (recall by
+  width unchanged). GB: FN edge −5.8% but FP near +4.6% (draws roads wider), FN interior +1.5%.
