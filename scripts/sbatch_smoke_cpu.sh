@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --partition=cpu_short
 #SBATCH --account=torch_pr_627_general
 #
@@ -60,7 +60,7 @@ read -r -a SEEDS <<<"${SMOKE_SEEDS:-0 1}"
 TILE="${SMOKE_TILE:-256}"
 STRIDE=$(( TILE / 2 ))
 WORKERS="${SMOKE_WORKERS:-2}"
-STEPS=" ${SMOKE_STEPS:-grid aggregate drills bf16} "
+STEPS=" ${SMOKE_STEPS:-grid ottawa aggregate drills bf16} "
 
 export ROADSEG_CODE="$CODE"
 export PYTHONPATH="$PROJECT/.deps:$CODE/src"
@@ -149,6 +149,28 @@ for dataset in "${DATASETS[@]}"; do
         done
     done
 done
+fi
+
+# ---- 1b. Ottawa (third dataset): the campaign's rungs, one seed, the same checks -------------
+if section ottawa; then
+for name in R0 GA GD; do
+    run="$RUNS/ottawa_${name}_s0"
+    train=("$PY" -m roadseg.train --config "$CODE/configs/ottawa.yaml" --rung "$name" --seed 0
+           "${SHORT[@]}" "${SMALL[@]}" --no-amp --preflight --runs-dir "$RUNS")
+    score=("$PY" -m roadseg.eval --run "$run" --split test --tile "$TILE" --stride "$STRIDE"
+           --limit 3 --workers "$WORKERS")
+    step "train $run"
+    out=$("${train[@]}")
+    echo "$out"
+    grep -q "^preflight ok:" <<<"$out" || fail "$run: no 'preflight ok' line"
+    [[ -s "$run/metrics.json" ]] || fail "$run/metrics.json is missing after training"
+    step "score the test split of $run"
+    "${score[@]}"
+    [[ -s "$run/test_metrics.json" ]] || fail "$run/test_metrics.json is missing"
+done
+step "aggregate ottawa with the ott plan"
+"$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset ottawa --split test --allow-nonstandard --plan ott
+[[ -s "$RUNS/ottawa_test_ott_summary.json" ]] || fail "no ott summary"
 fi
 
 # ---- 2. aggregation --------------------------------------------------------------------------

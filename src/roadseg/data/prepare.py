@@ -36,8 +36,8 @@ def deepglobe_splits(root: Path, seed: int = DEEPGLOBE_SPLIT_SEED) -> dict[str, 
 
 def build_index(root: Path, dataset: str, split: str) -> list[dict]:
     root = Path(root)
-    if dataset not in ("deepglobe", "massachusetts"):
-        raise ValueError(f"unknown dataset {dataset!r}; valid: 'deepglobe', 'massachusetts'")
+    if dataset not in ("deepglobe", "massachusetts", "ottawa"):
+        raise ValueError(f"unknown dataset {dataset!r}; valid: 'deepglobe', 'massachusetts', 'ottawa'")
     if split not in SPLITS:
         raise ValueError(f"unknown split {split!r} for {dataset}; valid splits: {list(SPLITS)}")
 
@@ -46,6 +46,10 @@ def build_index(root: Path, dataset: str, split: str) -> list[dict]:
                  "image": root / "train" / f"{i}_sat.jpg",
                  "mask": root / "train" / f"{i}_mask.png"}
                 for i in deepglobe_splits(root)[split]]
+    elif dataset == "ottawa":                  # prepared by scripts/prepare_ottawa.py
+        rows = [{"id": p.name[: -len("_sat.png")], "image": p,
+                 "mask": p.with_name(p.name.replace("_sat.png", "_mask.png"))}
+                for p in sorted((root / split).glob("*_sat.png"))]
     else:
         sub = _MASS_DIRS[split]
         rows = [{"id": p.stem, "image": p, "mask": root / f"{sub}_labels" / f"{p.stem}.tif"}

@@ -91,7 +91,7 @@ GEO_RUNG_WEIGHTS = {"GAc": {"geo_width_weight": 0.0}, "GAw": {"geo_centre_weight
 # as they did in the first campaign.
 GEO_DEFAULTS = {"geo_radii": list(RADII), "geo_centre_weight": 1.0, "geo_width_weight": 1.0}
 BASELINES = ("unet", "dlinknet")
-DATASETS = ("massachusetts", "deepglobe")
+DATASETS = ("massachusetts", "deepglobe", "ottawa")
 LR_FLOOR = 0.01                       # warmup starts at, and cosine decays to, LR_FLOOR * lr
 
 _REQUIRED = ("dataset", "data_root", "epochs", "tile", "stride", "val_stride", "batch_size",
@@ -992,7 +992,8 @@ def _train(args, cfg: dict, run: Path, device: str, build, code: dict, device_na
         tile_kw = dict(split="train", tile=cfg["tile"], road_bias=cfg["road_bias"],
                        limit=cfg["limit_train"], preload_workers=max(1, cfg["num_workers"]),
                        geo_radii=cfg["geo_radii"] if cfg["rung"] in GEO_RUNGS else None,
-                       geo_kind=cfg.get("geo_targets", "cover"))
+                       geo_kind=cfg.get("geo_targets", "cover"),
+                       crops_per_image=cfg.get("crops_per_image", 8))
         train_ds = RoadTileDataset(**data, **tile_kw, preload=False)          # index only
         steps_per_epoch = len(train_ds) // cfg["batch_size"]
         if cfg["max_train_batches"] is not None:

@@ -91,6 +91,9 @@ elif [[ "$CAMPAIGN" == geo3 ]]; then
         done
     done
     expected=12
+elif [[ "$CAMPAIGN" == ott ]]; then
+    plan_args=(--plan ott)                      # the primary: GA vs R0 on Ottawa (all in the map)
+    expected=15
 fi
 if (( total != expected )); then
     echo "AGGREGATE FAILED: the run map has $total entries, expected $expected" >&2
@@ -108,12 +111,18 @@ ls "$RUNS"/PREFLIGHT_FAILED.* 2>/dev/null | sed 's/^/NOTE preflight sentinel: /'
 status=0
 DATASETS_TO_AGGREGATE=(massachusetts deepglobe)
 [[ "$CAMPAIGN" == geo3 ]] && DATASETS_TO_AGGREGATE=(deepglobe)
+[[ "$CAMPAIGN" == ott ]] && DATASETS_TO_AGGREGATE=(ottawa)
 for dataset in "${DATASETS_TO_AGGREGATE[@]}"; do
     echo "=== $dataset$( (( ${#missing[@]} )) && echo '  (INCOMPLETE: not all runs are scored, see above)') ==="
     if ! "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test \
             ${plan_args[@]+"${plan_args[@]}"} ${stats_args[@]+"${stats_args[@]}"}; then
         echo "AGGREGATE FAILED for $dataset" >&2
         status=1
+    fi
+    if [[ "$CAMPAIGN" == ott ]]; then
+        echo "--- $dataset: every rung vs GD (secondary: GA vs DDT targets) ---"
+        "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test --plan ott \
+            --baseline GD ${stats_args[@]+"${stats_args[@]}"} || status=1
     fi
     if [[ "$CAMPAIGN" == geo3 ]]; then
         for base in R0 GA; do

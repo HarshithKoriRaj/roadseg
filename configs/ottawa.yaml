@@ -1,0 +1,7 @@
+_base: base.yaml
+dataset: ottawa
+data_root: /scratch/hk4488/roadseg/data/ottawa
+# 12 training scenes at 0.42 m (scripts/prepare_ottawa.py): 64 crops per scene per epoch
+# = 48 steps; 200 epochs = 9,600 steps (Massachusetts 55,400, DeepGlobe 87,160).
+epochs: 200
+crops_per_image: 64

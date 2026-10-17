@@ -9,6 +9,7 @@
 #   bash scripts/launch.sh --campaign geo  # paper 2: the 12 GA/GB runs + their aggregation
 #   bash scripts/launch.sh --campaign geo2 # paper 2 follow-up: 10 runs (see the array map)
 #   bash scripts/launch.sh --campaign geo3 # paper 2 baselines: 6 runs (GD, GO on DeepGlobe)
+#   bash scripts/launch.sh --campaign ott  # paper 2, third dataset: 15 runs on Ottawa
 #
 # Every job kind runs from the same frozen snapshot, the rehearsal included: nothing that is
 # submitted here reads the working tree, so the tree may be edited while jobs run.
@@ -73,7 +74,8 @@ case "$campaign" in
     geo) ARRAY_ARGS=(--array=0-11%12); NTASKS=12 ;;
     geo2) ARRAY_ARGS=(--array=0-9%10); NTASKS=10 ;;
     geo3) ARRAY_ARGS=(--array=0-5%6); NTASKS=6 ;;
-    *) echo "launch.sh: unknown campaign '$campaign' (dwt, geo, geo2 or geo3)" >&2; exit 2 ;;
+    ott) ARRAY_ARGS=(--array=0-14%15); NTASKS=15 ;;
+    *) echo "launch.sh: unknown campaign '$campaign' (dwt, geo, geo2, geo3 or ott)" >&2; exit 2 ;;
 esac
 if (( smoke && canary )); then
     echo "launch.sh: give one of --smoke and --canary, not both (one job kind per launch)" >&2

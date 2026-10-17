@@ -96,3 +96,15 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   GA .7753, GAw .7748, GD .7717. Output: logs/roadseg/stats_geo3_final_aggregate.txt.
 - 2026-10-17 user asked to download the Ottawa (RoadNet) dataset as the third dataset; gdown job
   20187991 (data/_dl/ottawa_raw).
+- 2026-10-17 THIRD DATASET = Ottawa (RoadNet, Liu et al. TGRS 2019; user's choice over CHN6-CUG,
+  which needs a request form). Downloaded via gdown (job 20188055; zip sha256 aacaa827…73fb6).
+  20 scenes (not 21), 0.21 m, manual road-SURFACE masks (red), widths 14–54 px (median 31).
+  scripts/prepare_ottawa.py: exact 2× box downsample to 0.42 m (widths 7–27 px; fits RADII;
+  smallest scene 512×640), mask = 2×2 majority; official test scenes 1, 16–20; val = scenes 9, 14
+  (default_rng(1337) from the authors' training scenes 2–15); train = the other 12. Right-edge
+  no-imagery strips cropped (scene 2: 168 cols, scene 1: 46 cols); scene 1 (test) keeps 1.45%
+  black pixels (strip not a clean full-height block) — same pixels for every arm, disclosed.
+- Campaign "ott" (branch feat/ott-dataset): R0, GA, GD × seeds 0–4 on Ottawa, 64 crops/scene/
+  epoch × 200 epochs = 9,600 steps. OTT_ANALYSIS_PLAN committed with this entry, before any
+  Ottawa run: primary GA vs R0 (Ottawa, 5 seeds); GA vs GD, GD vs R0 secondary; 6 test scenes →
+  coarse intervals, disclosed in the plan. Rehearsal gains an "ottawa" section; time limit 4 h.

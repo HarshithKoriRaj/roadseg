@@ -411,3 +411,51 @@ def test_geo3_plan_primary_is_ga_vs_gd_on_deepglobe(tmp_path):
     assert out["primary"]["conforms_to_plan"] and out["vs_baseline"]["GA"]["role"] == "primary"
     vs_r0 = stats.aggregate_runs(tmp_path, "deepglobe", plan="geo3")
     assert not vs_r0["primary"]["conforms_to_plan"]
+
+
+# ---------------------------------------------------------------- ott: the Ottawa dataset
+
+def _fake_ottawa(tmp_path, scenes=(("train", 2), ("train", 3), ("val", 9), ("test", 1)), size=(96, 128)):
+    from PIL import Image
+    for split, k in scenes:
+        d = tmp_path / split; d.mkdir(parents=True, exist_ok=True)
+        img = np.random.default_rng(k).integers(0, 255, size + (3,), dtype=np.uint8)
+        m = np.zeros(size, np.uint8); m[40:52, :] = 255
+        Image.fromarray(img).save(d / f"ottawa-{k}_sat.png")
+        Image.fromarray(m).save(d / f"ottawa-{k}_mask.png")
+    return tmp_path
+
+
+def test_ottawa_index_provenance_and_crops_per_image(tmp_path):
+    from roadseg.data.prepare import build_index
+    from roadseg.provenance import dataset_provenance
+    root = _fake_ottawa(tmp_path)
+    rows = build_index(root, "ottawa", "train")
+    assert [r["id"] for r in rows] == ["ottawa-2", "ottawa-3"] and all(r["mask"].exists() for r in rows)
+    assert [r["id"] for r in build_index(root, "ottawa", "test")] == ["ottawa-1"]
+    assert dataset_provenance(root, "ottawa", ("train", "val"))["n_images"] == {"train": 2, "val": 1}
+    ds = RoadTileDataset(root, "ottawa", "train", tile=64, crops_per_image=64)
+    assert len(ds) == 128 and ds[0]["valid"].min() == 1.0
+    assert len(RoadTileDataset(root, "deepglobe" if False else "ottawa", "train", tile=64)) == 16
+
+
+def test_ottawa_config_resolves_for_the_campaign_rungs():
+    for rung in ("R0", "GA", "GD"):
+        args = argparse.Namespace(config=str(ROOT / "configs/ottawa.yaml"), rung=rung, model=None,
+                                  seed=3, epochs=None, batch_size=None, workers=None, runs_dir=None,
+                                  max_train_batches=None, limit_train=None, limit_val=None,
+                                  no_preload=False, no_amp=False, no_pretrained=False, tile=None)
+        c = train.resolve_config(args)
+        assert c["dataset"] == "ottawa" and c["epochs"] == 200 and c["crops_per_image"] == 64
+        assert train.run_name(c) == f"ottawa_{rung}_s3"
+    mass = _cfg("R0")
+    assert "crops_per_image" not in mass               # the other datasets resolve as before
+
+
+def test_ott_plan_primary_is_ga_vs_r0_on_ottawa(tmp_path):
+    for s in range(5):
+        for rung, d in (("R0", 0.0), ("GA", 0.01), ("GD", 0.004)):
+            _write_run(tmp_path, rung, s, [b + d + 0.001 * s for b in BASE], 0.6, dataset="ottawa")
+    out = stats.aggregate_runs(tmp_path, "ottawa", plan="ott")
+    assert out["primary"]["conforms_to_plan"] and out["vs_baseline"]["GA"]["role"] == "primary"
+    assert not stats.aggregate_runs(tmp_path, "ottawa", baseline="GD", plan="ott")["primary"]["conforms_to_plan"]

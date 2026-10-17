@@ -86,6 +86,8 @@ def dataset_provenance(root, dataset: str, splits=SPLITS) -> dict:
         return {"n_images": {
             split: sum(1 for p in (root / _MASS_DIRS[split]).glob("*.tif*")
                        if p.suffix.lower() in (".tif", ".tiff")) for split in splits}}
+    if dataset == "ottawa":
+        return {"n_images": {split: len(list((root / split).glob("*_sat.png"))) for split in splits}}
     return {"n_images": {}}
 
 

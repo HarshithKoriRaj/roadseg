@@ -170,8 +170,29 @@ GEO3_ANALYSIS_PLAN = {
     "scope": "DeepGlobe only (3 seeds per arm).",
     "sensitivity": ANALYSIS_PLAN["sensitivity"],
 }
+# Paper 2, third dataset (campaign ott). Fixed 2026-10-17, before any Ottawa run was trained.
+# Ottawa (RoadNet, Liu et al. TGRS 2019): 0.21 m Google Earth imagery of Ottawa with manually
+# annotated road SURFACES (widths 14-54 px native, 7-27 px at the 0.42 m used here), the authors'
+# test scenes 1, 16-20. Only 6 test scenes: 5 seeds per arm, and the intervals will be wide.
+OTT_ANALYSIS_PLAN = {
+    "status": "pre-specified: committed before any Ottawa run was trained or scored",
+    "primary": {**GEO_ANALYSIS_PLAN["primary"], "comparison": "GA vs R0 (Ottawa, seeds 0-4)",
+                "rung": "GA", "baseline": "R0", "result": "vs_baseline.GA.two_level",
+                "datasets": ["ottawa"]},
+    "secondary": ("SECONDARY / descriptive, no multiplicity correction: GD vs R0, GA vs GD "
+                  "(--baseline GD), pooled IoU, other metrics. Ottawa is a replication of the "
+                  "DeepGlobe finding (GA > R0, confirmed there) on a third, independent dataset "
+                  "whose labels are manually drawn road surfaces of varying width."),
+    "coverage_note": ("With 6 test scenes the image level of the two-level bootstrap resamples 6 "
+                      "values: the interval is coarse and may be anti-conservative; the "
+                      "seed-paired t interval (5 seeds) is reported beside it. "
+                      + ANALYSIS_PLAN["coverage_note"]),
+    "decision_rule": GEO2_ANALYSIS_PLAN["decision_rule"],
+    "scope": "Ottawa only. No further seeds: an inconclusive result at 5 seeds is reported as such.",
+    "sensitivity": ANALYSIS_PLAN["sensitivity"],
+}
 PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN, "geo2": GEO2_ANALYSIS_PLAN,
-         "geo3": GEO3_ANALYSIS_PLAN}
+         "geo3": GEO3_ANALYSIS_PLAN, "ott": OTT_ANALYSIS_PLAN}
 
 
 def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:

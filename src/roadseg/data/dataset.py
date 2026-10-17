@@ -163,7 +163,8 @@ class RoadTileDataset(_RowSource, Dataset):
                  road_bias: float = 0.75, tries: int = 12, length: int | None = None,
                  augment: bool = True, preload: bool = False,
                  preload_workers: int = 8, limit: int | None = None,
-                 geo_radii: tuple | None = None, geo_kind: str = "cover") -> None:
+                 geo_radii: tuple | None = None, geo_kind: str = "cover",
+                 crops_per_image: int = 8) -> None:
         if tries < 1:
             raise ValueError(f"tries must be >= 1, got {tries}")
         super().__init__(root, dataset, split, preload, preload_workers, limit)
@@ -171,7 +172,9 @@ class RoadTileDataset(_RowSource, Dataset):
         self.augment = augment
         self.geo_radii = None if geo_radii is None else tuple(geo_radii)
         self.geo_kind = geo_kind
-        self.length = length or len(self.rows) * 8
+        # crops per epoch: 8 per image (Massachusetts, DeepGlobe); Ottawa has 12 large scenes and
+        # sets crops_per_image in its config
+        self.length = length or len(self.rows) * crops_per_image
 
     def __len__(self) -> int:
         return self.length
