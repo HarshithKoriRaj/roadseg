@@ -65,3 +65,23 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   by the rule → reported as NEEDING BOTH TERMS; the width term contributes most (pooled GAw
   .6849 vs GA .6858 vs R0 .6771), centre-line term alone ~0. Output:
   logs/roadseg/stats_geo2_final_aggregate.txt.
+- 2026-10-16 LITERATURE SEARCH: closest prior = Deep Distance Transform (Wang et al., CVPR 2020,
+  arXiv 1912.03383; medical CT): seg head + rounded-EDT "scale classes" at every foreground voxel
+  (classification, not regression) + ball reconstruction from a pseudo-skeleton at inference ≈ GA
+  + GB. Not found applied to roads. Road priors: Wei et al. ISPRS Annals 2020 (centre-line +
+  width regression, for vector extraction), Batra CVPR 2019 (orientation), BrightEarth 2024
+  (distance map), cascaded surface/centre-line/edge (IEEE 2022). Note: DeepGlobe is described in
+  the literature as precisely annotated with varying widths -> frame as "label widths vary", not
+  "inconsistent".
+- Campaign geo3 (branch feat/geo3-baselines, commit ba1e8e9): GD (DDT targets, 20 classes, all
+  road px) and GO (orientation from skeleton structure tensor, 18 bins + background), GA's model,
+  centre weight 0. GEO3_ANALYSIS_PLAN committed before launch: primary GA vs GD on DeepGlobe.
+  Suite 20064298 + rehearsal 20064301 submitted; launcher job 20064329 (afterok on both) runs
+  `launch.sh --campaign geo3` so a session drop cannot stall the launch again.
+- CHN6-CUG (third dataset) needs the user: download is behind a request form (name/email/
+  institution) at grzy.cug.edu.cn/zhuqiqi. Ottawa (RoadNet, Google Drive) is free but 21 images.
+- (The two entries above were written 2026-10-16 ~14:00 and parked uncommitted until launch: a
+  commit then would have moved HEAD off the rehearsed sha. The brief commit 91406a3 was reset.)
+- Suite 20064298 at ba1e8e9: 511 passed. Rehearsal 20064301: ALL PASSED (14:55). Launcher job
+  20064329 ran `launch.sh --campaign geo3` → **LAUNCHED: array 20079336 (6 tasks), aggregate
+  20079337, snapshot releases/ba1e8e9.**
