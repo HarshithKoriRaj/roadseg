@@ -85,3 +85,14 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
 - Suite 20064298 at ba1e8e9: 511 passed. Rehearsal 20064301: ALL PASSED (14:55). Launcher job
   20064329 ran `launch.sh --campaign geo3` → **LAUNCHED: array 20079336 (6 tasks), aggregate
   20079337, snapshot releases/ba1e8e9.**
+- 2026-10-17 geo3 COMPLETE (array 20079336 6/6, 0 failures; aggregate 20079337). Read 13:00.
+  PRIMARY (geo3 plan) DeepGlobe GA − GD per-image IoU +0.0046, boot [+0.0021, +0.0072], t
+  [+0.0025, +0.0068], per-seed +0.0055 +0.0045 +0.0038 → DIFFERENCE, GA ahead (pooled +0.0024).
+  Secondary vs R0: GD +0.0027 (no detected difference; pooled +0.0063), GO +0.0014 (no
+  difference; pooled +0.0041). GA − GO −… inconclusive (boot only). GAw − GD +0.0016 boot
+  [−0.0011, +0.0042] t [−0.0004, +0.0036] → no detected difference: the disc-cover WIDTH encoding
+  alone is not distinguishable from DDT's; GA's edge over DDT needs the centre term too.
+  Pooled IoU: R0 .6771, GO .6812, GD .6834, GAw .6849, GA .6858. APLS: GO .7768, R0 .7755,
+  GA .7753, GAw .7748, GD .7717. Output: logs/roadseg/stats_geo3_final_aggregate.txt.
+- 2026-10-17 user asked to download the Ottawa (RoadNet) dataset as the third dataset; gdown job
+  20187991 (data/_dl/ottawa_raw).
