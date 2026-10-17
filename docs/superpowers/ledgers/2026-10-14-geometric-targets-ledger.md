@@ -108,3 +108,12 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   epoch × 200 epochs = 9,600 steps. OTT_ANALYSIS_PLAN committed with this entry, before any
   Ottawa run: primary GA vs R0 (Ottawa, 5 seeds); GA vs GD, GD vs R0 secondary; 6 test scenes →
   coarse intervals, disclosed in the plan. Rehearsal gains an "ottawa" section; time limit 4 h.
+- 2026-10-17 suite 20190651 at 8cb06c4: 515 passed, 1 FAILED — test_sbatch_directives pins the
+  rehearsal's --time at 03:00:00; 8cb06c4 raised it to 04:00:00 (the grid grew). Rehearsal
+  20190653: ALL PASSED in 2 h 48 m under the 4 h limit, SMOKE_PASSED = 8cb06c4. The afterok
+  launcher 20190655 was therefore cancelled (as designed).
+  Ruling: launch 8cb06c4 by hand (`launch.sh --campaign ott`, rehearsal check enforced), then fix
+  the test's expected value in a later commit. The failure is a stale pinned constant, not a code
+  defect; the launched code is exactly the rehearsed commit. Cost if wrong: none for the runs.
+  **LAUNCHED 2026-10-17 18:01: array 20200093 (15 tasks, campaign ott), aggregate 20200094,
+  snapshot releases/8cb06c4.**

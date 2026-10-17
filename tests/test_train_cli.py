@@ -1307,7 +1307,7 @@ def test_sbatch_directives():
         "cpu_short", "4", "16G", "01:00:00")
     smoke = _directives(ROOT / "scripts/sbatch_smoke_cpu.sh")
     assert (smoke["--partition"], smoke["--cpus-per-task"], smoke["--mem"], smoke["--time"]) == (
-        "cpu_short", "16", "64G", "03:00:00")
+        "cpu_short", "16", "64G", "04:00:00")
     canary = _directives(ROOT / "scripts/sbatch_canary.sh")              # G6
     assert (canary["--partition"], canary["--gres"], canary["--cpus-per-task"], canary["--mem"],
             canary["--time"]) == ("l40s_public,h200_public", "gpu:1", "8", "48G", "00:40:00")
