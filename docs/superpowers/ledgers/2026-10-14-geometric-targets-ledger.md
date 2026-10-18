@@ -117,3 +117,14 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   defect; the launched code is exactly the rehearsed commit. Cost if wrong: none for the runs.
   **LAUNCHED 2026-10-17 18:01: array 20200093 (15 tasks, campaign ott), aggregate 20200094,
   snapshot releases/8cb06c4.**
+- 2026-10-18 ott COMPLETE (array 20200093 15/15, 0 failures; aggregate 20200094). Read 11:12.
+  PRIMARY (ott plan) Ottawa GA − R0 per-image IoU −0.0029, boot [−0.0081, +0.0024], t [−0.0105,
+  +0.0047], per-seed −0.0104 +0.0020 −0.0047 −0.0061 +0.0045 → no_detected_difference (final, no
+  more seeds). Secondary: GD − R0 −0.0048 inconclusive (boot only, R0 ahead); GA − GD +0.0019 no
+  difference. Pooled IoU R0 .8861 / GA .8828 / GD .8808 (Ottawa is near ceiling). APLS R0 .8828 /
+  GA .8394 / GD .8198 (secondary, 6 test scenes; large drop, not tested). Output:
+  logs/roadseg/stats_ott_final_aggregate.txt.
+  SYNTHESIS: GA − R0 is confirmed on DeepGlobe only (+0.0073); Massachusetts +0.0027 and Ottawa
+  −0.0029 show no detected difference. The DeepGlobe gain did NOT replicate on Ottawa; "helps when
+  label widths vary" is not supported (Ottawa widths vary but labels are precise surfaces and IoU
+  is ~0.88). GB (drawn mask) null on both datasets it ran on.
