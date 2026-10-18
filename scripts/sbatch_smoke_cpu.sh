@@ -55,7 +55,7 @@ for knob in SMOKE_DATASETS SMOKE_NAMES SMOKE_SEEDS SMOKE_TILE SMOKE_STEPS; do
     [[ -z "${!knob:-}" ]] || full=0
 done
 read -r -a DATASETS <<<"${SMOKE_DATASETS:-massachusetts deepglobe}"
-read -r -a NAMES <<<"${SMOKE_NAMES:-R0 R1 R2 R3 GA GB GAc GAw GD GO unet dlinknet}"
+read -r -a NAMES <<<"${SMOKE_NAMES:-R0 R1 R2 R3 GA GB GAc GAw GD GO GFa GFb unet dlinknet}"
 read -r -a SEEDS <<<"${SMOKE_SEEDS:-0 1}"
 TILE="${SMOKE_TILE:-256}"
 STRIDE=$(( TILE / 2 ))

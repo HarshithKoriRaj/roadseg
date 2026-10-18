@@ -76,8 +76,8 @@ from .runtime import (EXIT_CRASHED, EXIT_OK, EXIT_PREFLIGHT, EXIT_REFUSED,  # no
                       code_identity, describe_code, run_cli, same_code, tmp_name)
 
 PROJECT = Path(__file__).resolve().parents[2]
-RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB", "GAc", "GAw", "GD", "GO")
-GEO_RUNGS = ("GA", "GB", "GAc", "GAw", "GD", "GO")   # R0 + geometric targets (models/geo.py); paper 2
+RUNGS = ("R0", "R1", "R2", "R3", "GA", "GB", "GAc", "GAw", "GD", "GO", "GFa", "GFb")
+GEO_RUNGS = ("GA", "GB", "GAc", "GAw", "GD", "GO", "GFa", "GFb")   # GF*: geometry fed back (models/geo.py)   # R0 + geometric targets (models/geo.py); paper 2
 # Attribution of GA (campaign geo2): the same model and targets as GA, one loss term switched
 # off -- GAc keeps only the centre-line term, GAw only the width term.
 GEO_RUNG_WEIGHTS = {"GAc": {"geo_width_weight": 0.0}, "GAw": {"geo_centre_weight": 0.0},

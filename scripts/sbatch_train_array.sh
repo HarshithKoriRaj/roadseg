@@ -63,6 +63,18 @@
 #    5-9    ottawa          GA s0..s4
 #   10-14   ottawa          GD s0..s4
 #
+# Campaign "gfsel" (--array=0-5): geometry feedback, VARIANT SELECTION -- seed 0 of GFa and GFb on
+# every dataset; scripts/analysis/gf_select.py then picks one on validation IoU only.
+#
+#    0-2    GFa s0          massachusetts deepglobe ottawa
+#    3-5    GFb s0          massachusetts deepglobe ottawa
+#
+# Campaigns "gfconf_a" / "gfconf_b" (--array=0-5): the selected variant's seeds 1 and 2.
+#
+#    0-1    massachusetts   GF? s1 s2
+#    2-3    deepglobe       GF? s1 s2
+#    4-5    ottawa          GF? s1 s2
+#
 # Signals. Both are forwarded to python as SIGTERM; train.py then checkpoints after the
 # current optimizer step and exits 75. What happens next depends on WHICH signal it was:
 #
@@ -141,8 +153,23 @@ map_index() {
         DATASET=ottawa; NAME=${ott_name[$(( i / 5 ))]}; SEED=$(( i % 5 ))
         SELECT=(--rung "$NAME")
         return 0
+    elif [[ "$CAMPAIGN" == gfsel || "$CAMPAIGN" == gfconf_a || "$CAMPAIGN" == gfconf_b ]]; then
+        if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 5 )); then
+            echo "array index '$i' is outside 0-5 (campaign $CAMPAIGN)" >&2
+            return 1
+        fi
+        local gf_data=(massachusetts deepglobe ottawa)
+        if [[ "$CAMPAIGN" == gfsel ]]; then
+            local gf_name=(GFa GFb)
+            NAME=${gf_name[$(( i / 3 ))]}; DATASET=${gf_data[$(( i % 3 ))]}; SEED=0
+        else
+            NAME=GFa; [[ "$CAMPAIGN" == gfconf_b ]] && NAME=GFb
+            DATASET=${gf_data[$(( i / 2 ))]}; SEED=$(( 1 + i % 2 ))
+        fi
+        SELECT=(--rung "$NAME")
+        return 0
     elif [[ "$CAMPAIGN" != dwt ]]; then
-        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt, geo, geo2, geo3 or ott)" >&2
+        echo "unknown ROADSEG_CAMPAIGN '$CAMPAIGN' (dwt, geo, geo2, geo3, ott, gfsel, gfconf_a or gfconf_b)" >&2
         return 1
     fi
     if ! [[ "$i" =~ ^[0-9]+$ ]] || (( i > 35 )); then
@@ -169,6 +196,7 @@ if [[ "${1:-}" == "--print-map" ]]; then
     [[ "$CAMPAIGN" == geo2 ]] && last=9
     [[ "$CAMPAIGN" == geo3 ]] && last=5
     [[ "$CAMPAIGN" == ott ]] && last=14
+    [[ "$CAMPAIGN" == gfsel || "$CAMPAIGN" == gfconf_a || "$CAMPAIGN" == gfconf_b ]] && last=5
     for i in $(seq 0 "$last"); do
         map_index "$i"
         echo "$i $DATASET $NAME $SEED ${DATASET}_${NAME}_s${SEED}"

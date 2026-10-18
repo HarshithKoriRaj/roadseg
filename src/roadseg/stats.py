@@ -191,8 +191,39 @@ OTT_ANALYSIS_PLAN = {
     "scope": "Ottawa only. No further seeds: an inconclusive result at 5 seeds is reported as such.",
     "sensitivity": ANALYSIS_PLAN["sensitivity"],
 }
+# Geometry feedback (campaigns gfsel -> gfconf_a | gfconf_b). Fixed 2026-10-18, before any GF run
+# was trained. The user asked for an architectural addition after the Ottawa null; this is it.
+# Two variants (GFa: geometry predicted at 1/2 resolution and fed into the last decoder stage;
+# GFb: at 1/4, fed into the last two) were declared before any run. Selection: seed 0 of each on
+# every dataset; the variant with the higher MEAN over the three datasets of validation IoU at the
+# validation-selected threshold (metrics.json threshold_val_iou) is confirmed with seeds 1-2 (ties
+# -> GFa, the smaller change). No test score is read for the selection.
+def _gf_plan(rung: str) -> dict:
+    return {
+        "status": "pre-specified: committed before any GF run was trained or scored",
+        "primary": {**GEO_ANALYSIS_PLAN["primary"], "comparison": f"{rung} vs R0 (each dataset)",
+                    "rung": rung, "baseline": "R0", "result": f"vs_baseline.{rung}.two_level"},
+        "secondary": (f"SECONDARY, no multiplicity correction: {rung} vs GA (--baseline GA: does "
+                      "feeding the geometry back add anything beyond using it as a training target), "
+                      "and every other rung. Both GF variants, the selection rule and the selection "
+                      "runs' validation scores are reported, whichever variant wins."),
+        "selection": ("GFa vs GFb chosen on mean validation IoU over massachusetts, deepglobe, ottawa "
+                      "(seed 0), scripts/analysis/gf_select.py, before any test score is read."),
+        "coverage_note": ANALYSIS_PLAN["coverage_note"],
+        "decision_rule": GEO2_ANALYSIS_PLAN["decision_rule"].replace(
+            "For the primary there is no further seed extension: at 5 seeds an inconclusive result is "
+            "reported as such.", "No further seeds: an inconclusive result is reported as such."),
+        "scope": ("Applied to each of massachusetts, deepglobe, ottawa separately; nothing is corrected "
+                  f"for three datasets. {rung} has seeds 0-2; R0 and GA have seeds 0-4 on Massachusetts "
+                  "and Ottawa and 0-2 on DeepGlobe (the two-level bootstrap uses each arm's seeds; the "
+                  "seed-paired t uses the common seeds 0-2)."),
+        "sensitivity": ANALYSIS_PLAN["sensitivity"],
+    }
+
+
 PLANS = {"dwt": ANALYSIS_PLAN, "geo": GEO_ANALYSIS_PLAN, "geo2": GEO2_ANALYSIS_PLAN,
-         "geo3": GEO3_ANALYSIS_PLAN, "ott": OTT_ANALYSIS_PLAN}
+         "geo3": GEO3_ANALYSIS_PLAN, "ott": OTT_ANALYSIS_PLAN,
+         "gf_a": _gf_plan("GFa"), "gf_b": _gf_plan("GFb")}
 
 
 def decide(two_level: dict | None, paired_t: dict | None) -> tuple[str, dict]:

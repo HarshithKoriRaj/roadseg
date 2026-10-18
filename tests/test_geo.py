@@ -459,3 +459,82 @@ def test_ott_plan_primary_is_ga_vs_r0_on_ottawa(tmp_path):
     out = stats.aggregate_runs(tmp_path, "ottawa", plan="ott")
     assert out["primary"]["conforms_to_plan"] and out["vs_baseline"]["GA"]["role"] == "primary"
     assert not stats.aggregate_runs(tmp_path, "ottawa", baseline="GD", plan="ott")["primary"]["conforms_to_plan"]
+
+
+# ---------------------------------------------------------------- geometry feedback (GFa, GFb)
+
+from roadseg.models.geo import GF_STAGES, GeoFeedbackSegmenter
+
+
+@pytest.mark.parametrize("rung", ["GFa", "GFb"])
+def test_gf_shapes_and_the_mask_depends_on_the_fed_back_geometry(rung):
+    torch.manual_seed(0)
+    m = build_model({"rung": rung, "pretrained": False}).eval()
+    assert isinstance(m, GeoFeedbackSegmenter) and m.decoder.after == GF_STAGES[rung]
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        mask = m(x)
+        aux = m(x, aux=True)
+        assert mask.shape == (2, 1, 64, 64) and torch.equal(aux["mask"], mask)
+        assert aux["centre"].shape == (2, 1, 64, 64) and aux["width"].shape == (2, len(RADII), 64, 64)
+        m.decoder.geo_head.weight.add_(1.0)                 # change only the geometry head ...
+        assert not torch.allclose(m(x), mask)               # ... and the MASK changes: it is fed back
+
+
+@pytest.mark.parametrize("rung", ["GFa", "GFb"])
+def test_gf_mask_loss_alone_trains_the_geometry_head(rung):
+    torch.manual_seed(0)
+    m = build_model({"rung": rung, "pretrained": False})
+    out = m(torch.randn(2, 3, 64, 64), aux=True)
+    ComboLoss()(out["mask"], torch.zeros(2, 1, 64, 64)).backward()
+    assert m.decoder.geo_head.weight.grad is not None and m.decoder.geo_head.weight.grad.abs().sum() > 0
+    m.zero_grad()
+    b = _geo_batch()
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    assert np.isfinite(train_one_epoch(m, [b], train.build_loss(_cfg(rung)), opt, use_amp=False,
+                                       device="cpu", max_batches=1))
+
+
+def test_gf_config_and_extra_parameters():
+    for rung in ("GFa", "GFb"):
+        c = _cfg(rung)
+        assert c["geo_centre_weight"] == 1.0 and c["geo_width_weight"] == 1.0 and "geo_targets" not in c
+    n = lambda r: sum(p.numel() for p in build_model({"rung": r, "pretrained": False}).parameters())
+    assert 0 < n("GFa") - n("R0") < 50_000 and 0 < n("GFb") - n("R0") < 100_000
+
+
+def _gf_runs(tmp_path, vals):
+    for (v, d), x in vals.items():
+        r = tmp_path / f"{d}_{v}_s0"; r.mkdir()
+        (r / "metrics.json").write_text(json.dumps({"threshold_val_iou": x}))
+        (r / "test_metrics.json").write_text("NOT JSON: the selector must never open this")
+
+
+def test_gf_select_uses_validation_only_and_the_mean_rule(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gf_select", ROOT / "scripts/analysis/gf_select.py")
+    gs = importlib.util.module_from_spec(spec); spec.loader.exec_module(gs)
+    vals = {("GFa", "massachusetts"): 0.65, ("GFa", "deepglobe"): 0.68, ("GFa", "ottawa"): 0.89,
+            ("GFb", "massachusetts"): 0.66, ("GFb", "deepglobe"): 0.69, ("GFb", "ottawa"): 0.88}
+    _gf_runs(tmp_path, vals)
+    assert gs.main(["--runs-dir", str(tmp_path)]) == 0
+    sel = json.loads((tmp_path / "GF_SELECTION.json").read_text())
+    assert sel["selected"] == "GFb" and sel["campaign"] == "gfconf_b"     # mean .7433 > .7400
+    assert gs.main(["--runs-dir", str(tmp_path)]) == 0                   # re-run: same, no rewrite
+    tie = tmp_path / "tie"; tie.mkdir()
+    _gf_runs(tie, {k: 0.7 for k in vals})
+    assert gs.select(tie)["selected"] == "GFa"
+    (tmp_path / "ottawa_GFb_s0" / "metrics.json").unlink()
+    with pytest.raises(FileNotFoundError):
+        gs.select(tmp_path)
+
+
+def test_gf_plans_primary_per_dataset(tmp_path):
+    for ds in ("massachusetts", "ottawa"):
+        for s in range(3):
+            for rung, d in (("R0", 0.0), ("GA", 0.002), ("GFb", 0.01)):
+                _write_run(tmp_path, rung, s, [b + d + 0.001 * s for b in BASE], 0.6, dataset=ds)
+    for ds in ("massachusetts", "ottawa"):
+        out = stats.aggregate_runs(tmp_path, ds, plan="gf_b")
+        assert out["primary"]["conforms_to_plan"] and out["vs_baseline"]["GFb"]["role"] == "primary"
+    assert not stats.aggregate_runs(tmp_path, "ottawa", plan="gf_a")["primary"]["conforms_to_plan"]

@@ -3233,3 +3233,33 @@ def test_launch_ott_campaign_submits_15_tasks(tmp_path):
     assert rc == 0, out + err
     assert (f"--parsable --array=0-14%15 --export=ALL,ROADSEG_CODE={snap},ROADSEG_CAMPAIGN=ott "
             f"{snap}/scripts/sbatch_train_array.sh") in out and calls == []
+
+
+@pytest.mark.parametrize("campaign,expected", [
+    ("gfsel", [f"{d}_{v}_s0" for v in ("GFa", "GFb") for d in ("massachusetts", "deepglobe", "ottawa")]),
+    ("gfconf_a", [f"{d}_GFa_s{s}" for d in ("massachusetts", "deepglobe", "ottawa") for s in (1, 2)]),
+    ("gfconf_b", [f"{d}_GFb_s{s}" for d in ("massachusetts", "deepglobe", "ottawa") for s in (1, 2)])])
+def test_array_map_of_the_gf_campaigns(campaign, expected):
+    import subprocess
+    out = subprocess.run(["bash", str(ROOT / "scripts/sbatch_train_array.sh"), "--print-map"],
+                         env={"PATH": "/usr/bin:/bin", "ROADSEG_CAMPAIGN": campaign},
+                         capture_output=True, text=True, check=True).stdout.split("\n")
+    assert [line.split()[-1] for line in out if line.strip()] == expected
+
+
+def test_launch_gf_campaigns_submit_6_tasks(tmp_path):
+    repo, sha, short = _launch_repo(tmp_path)
+    snap = repo / "releases" / short
+    for campaign in ("gfsel", "gfconf_a", "gfconf_b"):
+        rc, out, err, calls = _launch(tmp_path, repo, "--dry-run", "--campaign", campaign, smoke=sha)
+        assert rc == 0, out + err
+        assert (f"--parsable --array=0-5%6 --export=ALL,ROADSEG_CODE={snap},ROADSEG_CAMPAIGN={campaign} "
+                f"{snap}/scripts/sbatch_train_array.sh") in out and calls == []
+
+
+def test_gfsel_aggregation_prints_no_test_scores(tmp_path):
+    import subprocess
+    r = subprocess.run(["bash", str(ROOT / "scripts/sbatch_aggregate.sh")],
+                       env={"PATH": "/usr/bin:/bin", "ROADSEG_CAMPAIGN": "gfsel", "ROADSEG_RUNS": str(tmp_path)},
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "no test aggregation" in r.stdout and "pooled" not in r.stdout and "PRIMARY" not in r.stdout

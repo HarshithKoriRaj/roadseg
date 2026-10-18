@@ -128,3 +128,15 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   −0.0029 show no detected difference. The DeepGlobe gain did NOT replicate on Ottawa; "helps when
   label widths vary" is not supported (Ottawa widths vary but labels are precise surfaces and IoU
   is ~0.88). GB (drawn mask) null on both datasets it ran on.
+- 2026-10-18 GEOMETRY FEEDBACK (user: "add something in the architecture"; agreed guardrails:
+  choose on validation only, pre-register, report every variant). Branch feat/gf-feedback.
+  GF = GA's targets/loss, geometry head moved into the decoder and its probabilities (13 ch)
+  concatenated into every later stage, so the mask uses the geometry at inference.
+  GFa: predicted after stage 3 (1/2 res), fed into stage 4. GFb: after stage 2 (1/4), fed into
+  stages 3–4. Campaign gfsel = seed 0 of both on all 3 datasets; scripts/analysis/gf_select.py
+  picks the higher MEAN validation IoU (threshold_val_iou; ties → GFa) and never opens test files;
+  gfsel's aggregation prints nothing. gfconf_a|b = the winner's seeds 1–2 on all 3 datasets.
+  Plans gf_a / gf_b (committed with this entry, before any GF run): primary GF? vs R0 per dataset,
+  secondary vs GA; both variants and the selection scores are reported whichever wins.
+  scripts/gf_chain.sh runs gfsel then (afterok) selection + confirmation without a human.
+  NOTE: validation IoU so far tracks test (DG: GA > R0 on both; Ottawa: GA < R0 on both).

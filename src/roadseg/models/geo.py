@@ -91,3 +91,74 @@ class GeoSegmenter(RoadSegmenter):
         if aux:
             return {"mask": mask, "centre": centre, "width": width}
         return mask
+
+
+# ---------------------------------------------------------------- geometry feedback (GFa, GFb)
+# GA discards its centre/width predictions at inference. GF predicts them PART-WAY up the decoder
+# and concatenates the predicted geometry (centre probability + width-class probabilities) into
+# every later decoder stage, so the mask head is computed from features that saw the geometry.
+# Same targets and loss as GA (losses.GeoLoss); the geometry logits are upsampled bilinearly to
+# the input size for the loss. Two variants, fixed before any run (campaign gfsel picks one on
+# VALIDATION IoU): the decoder stage after which geometry is predicted.
+
+GF_STAGES = {"GFa": 3, "GFb": 2}     # after stage 3: 64 ch at 1/2 res; after stage 2: 128 ch at 1/4
+
+
+class FeedbackDecoder(nn.Module):
+    """UNetDecoder (same widths, skips and up-sampling) plus a geometry head after stage
+    `after`, whose probabilities are concatenated into the input of every later stage."""
+
+    def __init__(self, enc_channels, n_geo: int, after: int,
+                 widths=(512, 256, 128, 64, 32), up: str = "bilinear") -> None:
+        super().__init__()
+        from .decoder import _ConvBlock
+        from .ops import make_up
+        f0, f1, f2, f3, f4 = enc_channels
+        skips = [f3, f2, f1, f0, 0]
+        ins = [f4] + list(widths[:-1])
+        extra = [n_geo if k > after else 0 for k in range(len(widths))]
+        self.after = after
+        self.ups = nn.ModuleList([make_up(up, i, w) for i, w in zip(ins, widths)])
+        self.blocks = nn.ModuleList([_ConvBlock(w + s + e, w) for w, s, e in zip(widths, skips, extra)])
+        self.geo_head = nn.Conv2d(widths[after], n_geo, 1)
+
+    def forward(self, feats: list[torch.Tensor]):
+        f0, f1, f2, f3, f4 = feats
+        x, geo, geo_logits = f4, None, None
+        for k, (up, block, skip) in enumerate(zip(self.ups, self.blocks, [f3, f2, f1, f0, None])):
+            x = up(x)
+            parts = [x] if skip is None else [x, skip]
+            if geo is not None:
+                parts.append(F.interpolate(geo, size=x.shape[-2:], mode="bilinear", align_corners=False))
+            x = block(torch.cat(parts, dim=1))
+            if k == self.after:
+                geo_logits = self.geo_head(x)
+                geo = torch.cat([torch.sigmoid(geo_logits[:, :1]),
+                                 torch.softmax(geo_logits[:, 1:], dim=1)], dim=1)
+        return x, geo_logits
+
+
+class GeoFeedbackSegmenter(nn.Module):
+    def __init__(self, rung: str, radii=RADII, pretrained: bool = True) -> None:
+        super().__init__()
+        if rung not in GF_STAGES:
+            raise ValueError(f"unknown feedback rung {rung!r}; expected one of {list(GF_STAGES)}")
+        from .encoder import ResNeXtEncoder
+        self.rung, self.mode, self.radii = rung, "feedback", tuple(int(r) for r in radii)
+        # R0's build order (decoder, head, encoder); the decoder's shapes differ from R0's.
+        self.decoder = FeedbackDecoder(ResNeXtEncoder.CHANNELS, 1 + len(self.radii), GF_STAGES[rung])
+        self.head = nn.Conv2d(32, 1, 1)
+        self.encoder = ResNeXtEncoder("R0", pretrained=pretrained)
+
+    def forward(self, x: torch.Tensor, aux: bool = False):
+        h, w = x.shape[-2:]
+        if h % 32 or w % 32:
+            raise ValueError(f"input spatial dims must be divisible by 32, got {(h, w)}; "
+                             "pad or crop the tile before the forward pass")
+        f, g = self.decoder(self.encoder(x))
+        mask = self.head(f)
+        assert mask.shape[-2:] == (h, w), f"resolution invariant violated: {mask.shape[-2:]} != {(h, w)}"
+        if aux:
+            g = F.interpolate(g, size=(h, w), mode="bilinear", align_corners=False)
+            return {"mask": mask, "centre": g[:, :1], "width": g[:, 1:]}
+        return mask

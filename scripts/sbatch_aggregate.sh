@@ -47,6 +47,13 @@ for arg in "$@"; do
 done
 
 cd "$PROJECT"
+if [[ "$CAMPAIGN" == gfsel ]]; then
+    # The selection campaign is judged on VALIDATION only (scripts/analysis/gf_select.py). Its
+    # runs are test-scored by the array like every run, but nothing aggregates or prints those
+    # scores until the confirmation campaign's pre-specified analysis.
+    echo "campaign gfsel: no test aggregation (selection uses validation IoU only)"
+    exit 0
+fi
 commit=$(cat "$CODE/COMMIT" 2>/dev/null || git -C "$CODE" rev-parse HEAD 2>/dev/null || echo unknown)
 echo "host $(hostname)  code $CODE  commit $commit  runs $RUNS  $(date)"
 
@@ -91,6 +98,19 @@ elif [[ "$CAMPAIGN" == geo3 ]]; then
         done
     done
     expected=12
+elif [[ "$CAMPAIGN" == gfconf_a || "$CAMPAIGN" == gfconf_b ]]; then
+    GF=GFa; [[ "$CAMPAIGN" == gfconf_b ]] && GF=GFb
+    plan_args=(--plan "gf_${GF: -1}")           # gf_a / gf_b: primary GF? vs R0, per dataset
+    for dataset in massachusetts deepglobe ottawa; do     # controls + the selection run (seed 0)
+        for name in R0 GA "$GF"; do
+            for seed in 0 1 2; do
+                [[ "$name" == "$GF" && "$seed" != 0 ]] && continue
+                total=$(( total + 1 ))
+                [[ -s "$RUNS/${dataset}_${name}_s${seed}/test_metrics.json" ]] || missing+=("${dataset}_${name}_s${seed}")
+            done
+        done
+    done
+    expected=27
 elif [[ "$CAMPAIGN" == ott ]]; then
     plan_args=(--plan ott)                      # the primary: GA vs R0 on Ottawa (all in the map)
     expected=15
@@ -112,12 +132,18 @@ status=0
 DATASETS_TO_AGGREGATE=(massachusetts deepglobe)
 [[ "$CAMPAIGN" == geo3 ]] && DATASETS_TO_AGGREGATE=(deepglobe)
 [[ "$CAMPAIGN" == ott ]] && DATASETS_TO_AGGREGATE=(ottawa)
+[[ "$CAMPAIGN" == gfconf_a || "$CAMPAIGN" == gfconf_b ]] && DATASETS_TO_AGGREGATE=(massachusetts deepglobe ottawa)
 for dataset in "${DATASETS_TO_AGGREGATE[@]}"; do
     echo "=== $dataset$( (( ${#missing[@]} )) && echo '  (INCOMPLETE: not all runs are scored, see above)') ==="
     if ! "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test \
             ${plan_args[@]+"${plan_args[@]}"} ${stats_args[@]+"${stats_args[@]}"}; then
         echo "AGGREGATE FAILED for $dataset" >&2
         status=1
+    fi
+    if [[ "$CAMPAIGN" == gfconf_a || "$CAMPAIGN" == gfconf_b ]]; then
+        echo "--- $dataset: every rung vs GA (secondary: does feeding the geometry back add to GA?) ---"
+        "$PY" -m roadseg.stats --runs-dir "$RUNS" --dataset "$dataset" --split test \
+            "${plan_args[@]}" --baseline GA ${stats_args[@]+"${stats_args[@]}"} || status=1
     fi
     if [[ "$CAMPAIGN" == ott ]]; then
         echo "--- $dataset: every rung vs GD (secondary: GA vs DDT targets) ---"
