@@ -140,3 +140,16 @@ Spec: `docs/superpowers/specs/2026-10-14-geometric-targets-design.md`.
   secondary vs GA; both variants and the selection scores are reported whichever wins.
   scripts/gf_chain.sh runs gfsel then (afterok) selection + confirmation without a human.
   NOTE: validation IoU so far tracks test (DG: GA > R0 on both; Ottawa: GA < R0 on both).
+- 2026-10-18 tests 20245961 + rehearsal 20245962 passed at c430651; gf-chain 20245963 launched
+  gfsel (array 20253709); selector 20253712 (afterok) — VALIDATION IoU, seed 0:
+  GFa mass .6501 / dg .6879 / ott .9006, mean .7462; GFb .6498 / .6890 / .8986, mean .7458 →
+  GFa selected (margin .0004, essentially a tie); launched gfconf_a (array 20281436, aggregate
+  20281440) 2026-10-18 22:03. All runs completed, 0 failures. Read 2026-10-23 11:50.
+- GF RESULTS (plan gf_a, per dataset; GFa seeds 0–2):
+  PRIMARY GFa − R0: Massachusetts +0.0032 boot [−0.0018, +0.0085] t [−0.0031, +0.0077] → no
+  detected difference; DeepGlobe +0.0056 boot [+0.0012, +0.0103] t [−0.0072, +0.0183] →
+  INCONCLUSIVE (boot only; per-seed +0.0045 +0.0010 +0.0111); Ottawa −0.0032 → no detected
+  difference. Secondary GFa − GA: +0.0006 / −0.0017 / −0.0002, no detected difference on any
+  dataset → feeding the geometry back adds nothing measurable over GA. Pooled IoU GFa .6591 /
+  .6850 / .8833. APLS (secondary): Ottawa R0 .8828, GA .8394, GFa .8644 (partial recovery);
+  Mass/DG unchanged. No further seeds (plan). Output: logs/roadseg/stats_gf_a_final_aggregate.txt.
