@@ -58,6 +58,9 @@ def main():
         s = summarise([r for r in m["per_image"] if r["n_valid"] > 0])
         # cross-check: pooled IoU must equal what the scorer recorded
         assert abs(s["iou"] - m["aggregate"]["dataset_iou"]) < 1e-9, run
+        a = m["aggregate"]   # per-image means as recorded by the scorer (secondary metrics)
+        s.update(iou_img=a["mean_iou"], rf1=a["mean_relaxed_f1"], cldice=a["mean_cl_dice"],
+                 apls=a["mean_apls"])
         for k, v in s.items():
             out[dataset][name][k].append(v)
         out[dataset][name]["seeds"].append(seed)

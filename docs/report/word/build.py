@@ -1,8 +1,9 @@
 """Build roadseg_report.docx: fill metric tables from the run directories, then pandoc -> docx.
 
-Every number in the metric tables is computed here from runs/<dataset>_<model>_s<seed>/test_metrics.json
-(per-image TP/FP/FN/TN pooled over the test images, mean +- sd over seeds 0-2). The statistical
-contrasts are copied from the pre-specified analysis logs (logs/roadseg/stats_*_final*.txt).
+Every number in the metric tables comes from extended_metrics.json, which extended_metrics.py
+computes from runs/<dataset>_<model>_s<seed>/test_metrics.json (per-image TP/FP/FN/TN pooled
+over the test images; mean +- sd over seeds). The statistical contrasts in report_src.md are
+copied from the pre-specified analysis logs (logs/roadseg/stats_*_final*.txt).
 """
 import json
 import re
@@ -13,52 +14,39 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-RUNS = Path("/scratch/hk4488/roadseg/runs")
 PANDOC = "/scratch/hk4488/.cache/pypandoc/pypandoc/files/pandoc"
 EXT = json.load(open(HERE / "extended_metrics.json"))
 
-MODELS = [  # (key, display name)
-    ("unet", "U-Net"),
-    ("dlinknet", "D-LinkNet"),
-    ("R0", "R0 (control)"),
-    ("R1", "R1 (DWT, draft)"),
-    ("R2", "R2 (wavelet)"),
-    ("R3", "R3 (+clDice)"),
-    ("GA", "GA (geo. aux.)"),
-    ("GB", "GB (geo. drawn)"),
-]
-DATASETS = [("deepglobe", "DeepGlobe"), ("massachusetts", "Massachusetts Roads")]
+LABEL = {"unet": "U-Net", "dlinknet": "D-LinkNet", "R0": "R0 (control)", "R1": "R1 (DWT)",
+         "R2": "R2 (wavelet)", "R3": "R3 (+clDice)", "GA": "GA", "GB": "GB", "GAc": "GAc",
+         "GAw": "GAw", "GD": "GD (DDT)", "GO": "GO (orient.)", "GFa": "GFa", "GFb": "GFb"}
+ORDER = ["unet", "dlinknet", "R0", "R1", "R2", "R3", "GA", "GB", "GAc", "GAw", "GD", "GO",
+         "GFa", "GFb"]
 
 
-def topo(dataset, model):
-    """Per-image (mean over images) IoU, relaxed F1, clDice, APLS for seeds 0-2."""
-    out = {"iou_img": [], "rf1": [], "cldice": [], "apls": []}
-    for s in range(3):
-        a = json.load(open(RUNS / f"{dataset}_{model}_s{s}" / "test_metrics.json"))["aggregate"]
-        out["iou_img"].append(a["mean_iou"])
-        out["rf1"].append(a["mean_relaxed_f1"])
-        out["cldice"].append(a["mean_cl_dice"])
-        out["apls"].append(a["mean_apls"])
-    return out
+def models(dataset):
+    return [k for k in ORDER if k in EXT[dataset]]
 
 
 def cell(vals, best):
-    m, sd = st.mean(vals), st.stdev(vals)
-    txt = f"{100 * m:.2f}±{100 * sd:.2f}"
+    m = st.mean(vals)
+    txt = f"{100 * m:.2f}±{100 * st.stdev(vals):.2f}" if len(vals) > 1 else f"{100 * m:.2f}"
     return f"**{txt}**" if best else txt
 
 
-def table(dataset, cols, source):
-    """Markdown pipe table; bold = best mean in the column (ties at 2 decimals all bold)."""
-    data = {k: source(dataset, k) for k, _ in MODELS}
-    best = {c: max(round(100 * st.mean(data[k][c]), 2) for k, _ in MODELS) for c, _ in cols}
-    head = "| Model | " + " | ".join(h for _, h in cols) + " |"
+def table(dataset, cols):
+    """Markdown pipe table; bold = best mean in the column among models with >= 3 seeds."""
+    ms = models(dataset)
+    full = [k for k in ms if len(EXT[dataset][k]["seeds"]) >= 3]
+    best = {c: max(round(100 * st.mean(EXT[dataset][k][c]), 2) for k in full) for c, _ in cols}
+    head = "| Model | n | " + " | ".join(h for _, h in cols) + " |"
     # dash counts set relative column widths (pandoc uses them when a row exceeds 72 chars)
-    sep = "|:" + "-" * 8 + "|" + "|".join("-" * (int(64 / len(cols)) - 1) + ":" for _ in cols) + "|"
+    sep = "|:" + "-" * 6 + "|" + "-" * 2 + ":|" + "|".join("-" * (int(64 / len(cols)) - 1) + ":" for _ in cols) + "|"
     rows = []
-    for k, name in MODELS:
-        cells = [cell(data[k][c], round(100 * st.mean(data[k][c]), 2) == best[c]) for c, _ in cols]
-        rows.append(f"| {name} | " + " | ".join(cells) + " |")
+    for k in ms:
+        v = EXT[dataset][k]
+        cells = [cell(v[c], k in full and round(100 * st.mean(v[c]), 2) == best[c]) for c, _ in cols]
+        rows.append(f"| {LABEL[k]} | {len(v['seeds'])} | " + " | ".join(cells) + " |")
     return "\n".join([head, sep, *rows])
 
 
@@ -68,11 +56,34 @@ TOPO_COLS = [("iou_img", "IoU (per image)"), ("rf1", "Relaxed F1 (ρ = 3)"),
              ("cldice", "clDice"), ("apls", "APLS")]
 
 
+def mean_of(dataset, model, metric):
+    return f"{st.mean(EXT[dataset][model][metric]):.4f}"
+
+
+def explainer_paragraphs(md):
+    """Inside Explainer boxes, turn '- item' lines into separate shaded paragraphs: Word list
+    paragraphs would lose the box style (and escape 'select all instances' deletion)."""
+    out, inside = [], False
+    for line in md.split("\n"):
+        if line.startswith('::: {custom-style="Explainer"}'):
+            inside = True
+        elif line.strip() == ":::" and inside:
+            inside = False
+        elif inside and line.startswith("- "):
+            out.extend(["• " + line[2:], ""])
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def fill(md):
-    for ds, _ in DATASETS:
-        md = md.replace("{{MAIN_%s}}" % ds, table(ds, MAIN_COLS, lambda d, k: EXT[d][k]))
-        md = md.replace("{{TOPO_%s}}" % ds, table(ds, TOPO_COLS, topo))
-    left = re.findall(r"\{\{[A-Z_a-z]+\}\}", md)
+    for ds in EXT:
+        md = md.replace("{{MAIN_%s}}" % ds, table(ds, MAIN_COLS))
+        md = md.replace("{{TOPO_%s}}" % ds, table(ds, TOPO_COLS))
+    # inline numbers: {{V:dataset:model:metric}}
+    md = re.sub(r"\{\{V:(\w+):(\w+):(\w+)\}\}", lambda m: mean_of(*m.groups()), md)
+    md = explainer_paragraphs(md)
+    left = re.findall(r"\{\{[^}]+\}\}", md)
     assert not left, left
     return md
 
@@ -101,10 +112,17 @@ def reference_docx(path):
             x = x.replace('<w:sz w:val="24" />\n        <w:szCs w:val="24" />',
                           '<w:sz w:val="22" />\n        <w:szCs w:val="22" />', 1)
             x = x.replace("</w:styles>",
+                          # "Explainer": shaded, indented tutorial paragraphs (delete for a paper)
+                          '<w:style w:type="paragraph" w:customStyle="1" w:styleId="Explainer">'
+                          '<w:name w:val="Explainer"/><w:basedOn w:val="BodyText"/><w:qFormat/>'
+                          '<w:pPr><w:pBdr><w:left w:val="single" w:sz="18" w:space="8" w:color="5B9BD5"/></w:pBdr>'
+                          '<w:shd w:val="clear" w:color="auto" w:fill="EAF2FB"/>'
+                          '<w:spacing w:before="60" w:after="60"/><w:ind w:left="240" w:right="120"/></w:pPr>'
+                          '<w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style>'
                           '<w:style w:type="paragraph" w:customStyle="1" w:styleId="TableText">'
                           '<w:name w:val="Table Text"/><w:basedOn w:val="Compact"/>'
                           '<w:pPr><w:spacing w:before="20" w:after="20"/></w:pPr>'
-                          '<w:rPr><w:sz w:val="17"/><w:szCs w:val="17"/></w:rPr></w:style></w:styles>')
+                          '<w:rPr><w:sz w:val="16"/><w:szCs w:val="16"/></w:rPr></w:style></w:styles>')
             data = x.encode("utf8")
         if item.filename == "word/document.xml":
             x = data.decode("utf8")
